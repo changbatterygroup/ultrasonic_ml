@@ -1,7 +1,7 @@
 import sys
-sys.path.append('/Users/xz498/Desktop/ultrasound project/data analysis/ultrasonic_ml/src')
-sys.path.append('/Users/xz498/Desktop/ultrasound project/data analysis/M3Learning-Util/src')
-sys.path.append('/Users/xz498/Desktop/ultrasound project/data analysis/AutoPhysLearn/src')
+sys.path.append('/Users/xz498/Desktop/ultrasound/data_analysis/ultrasonic_ml/src')
+sys.path.append('/Users/xz498/Desktop/ultrasound/data_analysis/M3Learning-Util/src')
+sys.path.append('/Users/xz498/Desktop/ultrasound/data_analysis/AutoPhysLearn/src')
 import os
 
 from random import shuffle
@@ -28,16 +28,29 @@ def plot_torch(x):
     plt.plot(x.detach().numpy())
     plt.show()
 
-class morlet_1D_fitters_complex():
-    def __init__(self, limits=[1,1,975], device='cpu'):
+class morlet_1D_complex_fitter():
+    '''Fitter for complex Morlet profiles in frequency domain.
+    This class implements the complex Morlet profile as described in:
+    https://www.sciencedirect.com/science/article/pii/S1631071312001848
+    Args:
+        limits (list): Scale factors for [A, x, w]. Defaults to [1, 1, 975]
+        device (str): Device to run computations on. Defaults to 'cpu'
+    '''
+    def __init__(self, limits=[1,1,975], device='cpu',resonant_frequency=2.25e-6,spec_len=10000):
+        '''Initialize the fitter.
+        Args:
+            limits (list): Scale factors for [A, x, w]. Defaults to [1, 1, 975]
+            device (str): Device to run computations on. Defaults to 'cpu'
+        '''
         self.limits = limits
-        self.f = 4.5e-03# 2.25 MHz # TODO: make this an init parameter
-    
+        self.f = 4.5e03# 2.25 MHz # TODO: make this an init parameter
+        self.spec_len = spec_len
+        
     def scale_parameters(self, embedding):
         '''scale parameters using given limits'''
         a_f = self.limits[0] * embedding[..., 0] # amplitude
-        mu_t = self.limits[1] * embedding[..., 1] # mean in time domain
-        sigma_f = self.limits[2] * embedding[..., 2] # standard deviation
+        mu_t = self.limits[1] * embedding[..., 1]*self.spec_len # mean in time domain
+        sigma_f = self.limits[2] * embedding[..., 2]*2 # standard deviation, factor of 2 bc fft splits the spectrum in half
         mu_f = (self.limits[3] * embedding[..., 3] + 1) * self.f # %deviation in frequency domain from 2.25 MHz [-1,1]
         
         return torch.stack([a_f,mu_t,sigma_f,mu_f],axis=2)
@@ -67,7 +80,6 @@ class morlet_1D_fitters_complex():
         '''Generate 1D Morlet profiles from embedding parameters.
         # H2O: 1.5 MRayl (specific acoustic impedance), 1500 m/s -> TT= 13,333 ns
         impedance, loss coefficient, and travel time of the layer
-        mode (str) : 'echo', 'transmission', 'both' - the acoustic signal type to generate
 
         not compatible with cwt: pi**-0.25 * (exp(1j*w*(x - mu)) - exp(-0.5*(w**2))) * exp(-0.5*(x - mu)**2)
         compatible with cwt: exp(1j*w*x/s) * exp(-0.5*(x/s)**2) * pi**(-0.25) * sqrt(1/s)
@@ -82,20 +94,17 @@ class morlet_1D_fitters_complex():
         '''
         device = embedding.device
         # Unpack embedding tensor along last dimension (shape: [..., 4])
-        a = embedding[..., 0].unsqueeze(-1)  # amplitude
-        mu = embedding[..., 1].unsqueeze(-1)  # center frequency
-        sigma = embedding[..., 2].unsqueeze(-1)  # standard deviation of gaussian window
-        f = embedding[..., 3].unsqueeze(-1)  # angular frequency fraction deviation from 2.25 MHz
+        a_t = embedding[..., 0].unsqueeze(-1)  # amplitude
+        mu_t = embedding[..., 1].unsqueeze(-1)  # center frequency
+        sigma_t = embedding[..., 2].unsqueeze(-1)  # standard deviation of gaussian window
+        mu_f = embedding[..., 3].unsqueeze(-1)  # angular frequency fraction deviation from 2.25 MHz
         
-        s = a.shape  # (_, num_fits)
+        s = a_t.shape  # (_, num_fits)
         t = torch.arange(spec_len, dtype=torch.float32).repeat(s[0],s[1],1).to(device)
-
-        # Calculate Morlet profile
-        morlet = a * torch.exp(-0.5 * ((t - mu) / sigma)**2) * torch.exp(1j * 2 * np.pi * f * (t-mu))
         
-        return morlet.to(torch.float32)
+        return a_t * torch.exp(-(t - mu_t)**2 / (2 * sigma_t**2)) * torch.exp(1j * 2 * np.pi * mu_f * (t - mu_t))
 
-    def generate_fit(self, embedding, spec_len):
+    def generate_fit(self, embedding, spec_len=None, **kwargs):
             
         """Calculate the Gaussian component in frequency domain. (no interpolation yet)
         
@@ -105,12 +114,15 @@ class morlet_1D_fitters_complex():
                 - mu_t: Center frequency in time domain (index 1)
                 - sigma_f: Standard deviation in frequency domain (index 2)
                 - mu_f: Center frequency in frequency domain (index 3)
-            spec_len (int): Length of the spectrum
+            spec_len (int): Length of the spectrum. If None, uses self.spec_len
         
         Returns:
             fit (torch.Tensor): Tensor of shape (batch_size, num_fits, spec_len) containing the fitted spectrum
             time_embedding_ (torch.Tensor): Tensor of shape (batch_size, num_fits, 4) containing the time domain parameters
         """
+        if spec_len is None:
+            spec_len = self.spec_len
+            
         a_f = embedding[..., 0].unsqueeze(-1)
         mu_t = embedding[..., 1].unsqueeze(-1) #(t domain)
         sigma_f = embedding[..., 2].unsqueeze(-1)
@@ -121,13 +133,13 @@ class morlet_1D_fitters_complex():
         fit = a_f * torch.exp(-(f - mu_f)**2 / (2 * sigma_f**2)) 
         
         ## calculate in time domain
-        sigma_t = 1/2/np.pi/sigma_f
+        sigma_t = 1/2/np.pi/sigma_f * spec_len
         a_t = a_f/(2*np.pi*sigma_t**2)**0.5
         time_embedding = torch.stack([a_t, mu_t, sigma_t, mu_f], axis=2).squeeze(-1)
         
         return fit, time_embedding
 
-
+# TODO: should the function class be a parent?
 class Fitter_AE:
     """Autoencoder-based fitter for spectroscopic data.
 
@@ -198,6 +210,10 @@ class Fitter_AE:
         self.optimizer = optim.Adam( self.encoder.parameters(), lr=self.learning_rate )
         self.lr_scheduler = CosineAnnealingLR(optimizer=self.optimizer, T_max=100, eta_min=self.learning_rate/100)
         self.configure_dataloader()
+        self.lowpass = dset.lowpass
+        self.bandpass_inds = slice(0, self.lowpass)
+   
+        
         
         self.start_epoch = 0
         self.best_train_loss = float('inf')
@@ -385,9 +401,9 @@ class Fitter_AE:
         # else: losses['l2_loss'] = 0
         
         # MSE loss (frequency domain- mag of fft)
-        primary_loss = loss_components['primary'](torch.abs(x).float(), predicted_x.float(), reduction='mean')
+        primary_loss = loss_components['primary'](torch.abs(x[self.bandpass_inds]).float(), predicted_x[self.bandpass_inds].float(), reduction='mean')
 
-        # group_delay_loss (time domain- group delays) TODO: is mse ok?
+        # group_delay_loss (time domain- group delays) TODO: is mse ok? #TODO: look for numerical error accumulation in group delay
         angles = torch.cumsum(torch.diff(torch.angle(x)), dim=1)
         group_delay = -torch.gradient(angles, dim=1)[0]
         pred_delays = torch.nn.functional.interpolate(

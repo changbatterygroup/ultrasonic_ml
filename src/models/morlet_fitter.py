@@ -23,7 +23,7 @@ import wandb
 import numpy as np
 import h5py
 
-class morlet_1D_fitters_real():
+class morlet_1D_real_fitter():
     def __init__(self, limits=[1,1,975], device='cpu'):
         self.limits = limits
         self.omega = 4.5e-03# 2.25 MHz # TODO: make this an init parameter
@@ -90,10 +90,10 @@ class morlet_1D_fitters_real():
         return morlet.to(torch.float32)
 
 
-class morlet_1D_fitters_complex():
-    def __init__(self, limits=[1,1,975], device='cpu'):
+class morlet_1D_complex_fitter():
+    def __init__(self, limits=[1,1,975], device='cpu', omega=4.5e-03):
         self.limits = limits
-        self.omega = 4.5e-03# 2.25 MHz # TODO: make this an init parameter
+        self.omega = omega # 2.25 MHz # TODO: make this an init parameter
     
     def scale_parameters(self, embedding):
         a = self.limits[0] * embedding[..., 0] # amplitude
