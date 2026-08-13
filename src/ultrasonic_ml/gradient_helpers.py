@@ -1,51 +1,95 @@
+import itertools
 import sys
 # sys.path.append('..') # path to the src directory
 # sys.path.append('/Users/xz498/Library/CloudStorage/OneDrive-DrexelUniversity/Chang Lab - Documents/General/Individual/Xinqiao Zhang/data_analysis/ultrasonicTesting/')
 
-import pickleJar as pj
-import sqliteUtils as squ
-import numpy as np
-from numpy import fft
+from concurrent.futures import ProcessPoolExecutor
+
+import os
 import os.path
-import matplotlib.pyplot as plt
+
+import pickleJar as pj
 
 import pickle
+from datetime import datetime
+import pandas as pd
+
+import numpy as np
+from scipy.optimize import curve_fit
+from scipy.signal import butter, sosfiltfilt
+
+from  sklearn.decomposition import PCA
+
+
 
 import matplotlib.pyplot as plt
+import matplotlib.cm as cm
 from ipywidgets import interact
 import ipywidgets as widgets
-from datetime import datetime
-import matplotlib.cm as cm
-import pandas as pd
-from scipy.optimize import curve_fit
+
+from mpire import WorkerPool
+from tqdm import tqdm
+
+
+
 
 ### data
-def stitch_interp_normalize_pickles(pickleFiles, saveName='combined.pickle', save_directory=None, num_points=2500, overwrite=False):
+
+def delete_old_pickles(sqliteFiles):
+    '''Delete old pickle files corresponding to the given sqlite files.'''
+    for sqliteFile in sqliteFiles:
+        pickleFile = sqliteFile.replace('.sqlite3', '.pickle')
+        if os.path.exists(pickleFile):
+            os.remove(pickleFile)
+            print(f"Deleted old pickle file: {pickleFile}")
+        else:
+            print(f"No pickle file found for: {sqliteFile}")
+            
+            
+def stitch_interp_normalize_pickles(pickleFiles, interp=True, saveName='combined.pickle', save_directory=None, num_points=2500, 
+                                    overwrite_pickles=False, overwrite_combined=False):
     """
-    Stitch together multiple pickle files into one, interpolating the data to a common time base.
-    
-    Parameters:
-    - pickleFiles: list of str, paths to the pickle files to be combined
-    - saveName: str, name of the output combined pickle file
-    - save_directory: str, path to the directory where the output file will be saved
-    - num_points: int, number of points to interpolate the data to
-    - overwrite: bool, whether to overwrite an existing output file
-    
-    Returns:
-    - combined_data: dict, the combined data from all pickle files
+    Stitch together multiple pickle files into one.
+    Crops to the latest start and earliest end time of all scans,
+    interpolates to ``num_points``, and normalizes the voltage to [-1, 1].
+    The combined result is written to a pickle file.
+
+    Parameters
+    ----------
+    pickleFiles : list of str
+        Paths to the pickle files to be combined.
+    interp : bool, default=True
+        Whether to interpolate the data.
+    saveName : str, default='combined.pickle'
+        Name of the output combined pickle file.
+    save_directory : str or None, default=None
+        Path to the directory where the output file will be saved.
+    num_points : int, default=2500
+        Number of points to interpolate the data to.
+    overwrite : bool, default=False
+        Whether to overwrite an existing pickle file.
+
+    Returns
+    -------
+    combined_data : dict
+        The combined data from all pickle files.
     """
     if save_directory: saveName = f'{save_directory}/{saveName}'
+    
+    if not overwrite_combined and os.path.isfile(saveName):
+        print(f"Combined pickle file already exists. Conversion aborted for {saveName}")
+        return -1
     
     combined_data = {'fileName': saveName, 
                      'parameters': {i: {} for i in range(len(pickleFiles))}}
     
     # check if the pickle file already exists. If it does, print an error message and exit early
     if os.path.isfile(combined_data['fileName']):
-        if overwrite:  os.remove(combined_data['fileName'])
+        if overwrite_pickles:  os.remove(combined_data['fileName'])
         else:
             print("sqliteToPickle Warning: pickle file " + combined_data['fileName'] + " already exists. Conversion aborted.")
-            return -1
-    
+            # return pj.loadPickle(combined_data['fileName'])
+
     start, end = 0, 100000
     for i, pickleFile in enumerate(pickleFiles):
         data = pj.loadPickle(pickleFile)
@@ -60,15 +104,16 @@ def stitch_interp_normalize_pickles(pickleFiles, saveName='combined.pickle', sav
         data = pj.loadPickle(pickleFile)
         combined_data['parameters'][i]['file_start_idx'] = int(idx)
         for k,v in data.items():
-            if str(k).isdigit(): 
+            if str(k).isdigit():
                 combined_data[idx] = v.copy()
-                combined_data[idx]['time'] = np.linspace(start, end, num_points)
                 combined_data[idx]['exp_idx'] = i
                 for key in v.keys():
                     if 'voltage' in key:
-                        combined_data[idx][key] = np.interp(combined_data[idx]['time'], v['time'], v[key])
-                        combined_data[idx][key] -= combined_data[idx][key][-50:].mean() # is there a better way to get the wave on 0?
-                        combined_data[idx][key] /= np.max(np.abs(combined_data[idx][key])) # normalize the voltage to [-1, 1]
+                        if interp: # TODO: need to recheck
+                            combined_data[idx]['time'] = np.linspace(start, end, num_points)
+                            combined_data[idx][key] = np.interp(combined_data[idx]['time'], v['time'], v[key])                
+                        else: 
+                            combined_data[idx][key] = v[key]
                 idx+=1
         combined_data['parameters'][i]['file_end_idx'] = int(idx)
     
@@ -76,40 +121,45 @@ def stitch_interp_normalize_pickles(pickleFiles, saveName='combined.pickle', sav
     with open(combined_data['fileName'], 'wb') as f:
         pickle.dump(combined_data, f)
     
-    return combined_data
+    # return combined_data
 
 
-def load_and_merge_to_data_df(data, monitor_file_path_list, settings_file_path_list, saveName='merged_df.pickle', save_directory='.', overwrite=False):
+def load_merge_to_controller_df(monitor_file_path_list, settings_file_path_list, monitor_cols = None, settings_cols = None):
+    """Load and merge controller data from multiple files into a single DataFrame.
+
+    Parameters
+    ----------
+    monitor_file_path_list : list of str or pathlib.Path
+        Paths to controller monitor log files.
+    settings_file_path_list : list of str or pathlib.Path
+        Paths to controller settings log files.
+    monitor_cols : list of str, optional
+        Columns to read from monitor logs. If None, all columns are read.
+    settings_cols : list of str, optional
+        Columns to read from settings logs. If None, all columns are read.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Merged controller monitor and settings data with a unified ``Time``
+        column in seconds since the Unix epoch and a ``Time_str`` column
+        preserving the original timestamp strings.
+
+    Notes
+    -----
+    The monitor and settings logs are concatenated, sorted by time, and
+    duplicate entries are dropped while keeping the last occurrence.
+    Milliseconds are added to the timestamp to produce a floating-point
+    seconds value.
     """
-    Load and merge monitor and settings data from CSV files, and combine with waveform data.
-    
-    Parameters:
-    - monitor_file_path_list: list of str, paths to the monitor CSV files
-    - settings_file_path_list: list of str, paths to the settings CSV files
-    - data: dict, the combined data from pickle files
-    
-    Returns:
-    - merged_df: pd.DataFrame, the merged DataFrame containing waveform and controller data
-    """
-    
-    measurements = {k:v for k,v in data.items() if isinstance(k, int)}
-    waveform_df = pd.DataFrame(measurements).transpose() 
-
-    controller_monitor_dfs = [pd.read_csv(file, delimiter=';', usecols=[ 'Time', 'Milliseconds',
-                                            '1000.1: CH1 Object', '1000.2: CH2 Object', # ###.#: is the firmware output for that channel.
-                                            '1001.1: CH1 Sink', '1001.2: CH2 Sink',
-                                            '1045.1: HR1 Temp', '1045.2: HR2 Temp',
-                                            '1044.1: LR1 Temp', '1044.2: LR2 Temp',
-                                            '3000.1: CH1 Target', '3000.2: CH2 Target',
-                                            '1044.3: LR3 Temp',
-                                        ]) for file in monitor_file_path_list]
+    print(f"Loading and merging controller logs")
+    controller_monitor_dfs = [pd.read_csv(file, delimiter=';', usecols=monitor_cols) for file in monitor_file_path_list]
 
     controller_monitor_df = (
         pd.concat(controller_monitor_dfs, ignore_index=True)
         .sort_values(['Time', 'Milliseconds'])
-        .drop_duplicates(subset=['Time'], keep='last')
-        .reset_index(drop=True)
-    )
+        .drop_duplicates(keep='last')
+        .reset_index(drop=True)  )
 
     controller_monitor_df['Time_str'] = controller_monitor_df['Time']
     controller_monitor_df['Time'] = controller_monitor_df['Time'].apply(lambda x: datetime.strptime(x, '%m/%d/%Y %I:%M:%S %p').timestamp())
@@ -117,19 +167,13 @@ def load_and_merge_to_data_df(data, monitor_file_path_list, settings_file_path_l
     controller_monitor_df.drop(columns=['Milliseconds'], inplace=True)  
 
     ## Read in settings data, add ms to time
-    controller_settings_dfs = [pd.read_csv(file, delimiter=';', usecols=[ 'Time', 'Milliseconds',
-                                            '2010.1: Output Enable', '2010.2: Output Enable', 
-                                            '3034.1: Peltier Polarity', '3034.2: Peltier Polarity',
-                                            '1200.1: Temperature is Stable','1200.2: Temperature is Stable',
-                                            '105.1: Error Number','106.1: Error Inst','107.1: Error Param'
-                                        ]) for file in settings_file_path_list]
+    controller_settings_dfs = [pd.read_csv(file, delimiter=';', usecols=settings_cols) for file in settings_file_path_list]
 
     controller_settings_df = (
         pd.concat(controller_settings_dfs, ignore_index=True)
         .sort_values(['Time', 'Milliseconds'])
-        .drop_duplicates(subset=['Time'], keep='last')
-        .reset_index(drop=True)
-    )
+        .drop_duplicates(keep='last')
+        .reset_index(drop=True) )
 
     controller_settings_df['Time_str'] = controller_settings_df['Time']
     controller_settings_df['Time'] = controller_settings_df['Time'].apply(lambda x: datetime.strptime(x, '%m/%d/%Y %I:%M:%S %p').timestamp())
@@ -138,8 +182,8 @@ def load_and_merge_to_data_df(data, monitor_file_path_list, settings_file_path_l
     
     controller_monitor_df.sort_values('Time', inplace=True)
     controller_settings_df.sort_values('Time', inplace=True)
-
-    ## Merge monitor and settings data
+    
+        ## Merge monitor and settings data
     controller_df = pd.merge_asof(
         left=controller_monitor_df,
         right=controller_settings_df,
@@ -148,26 +192,85 @@ def load_and_merge_to_data_df(data, monitor_file_path_list, settings_file_path_l
         direction='nearest' 
     )
 
+    # Convert time to float
+    controller_monitor_df['Time'] = controller_monitor_df['Time'].astype(float)
+    controller_settings_df['Time'] = controller_settings_df['Time'].astype(float)
+    controller_settings_df['Time'] = controller_settings_df['Time'].astype(float)
+
     # unify Time_str columns and remove the originals
     if 'Time_str_x' in controller_df.columns or 'Time_str_y' in controller_df.columns:
         controller_df['Time_str'] = controller_df.get('Time_str_x').fillna(controller_df.get('Time_str_y'))
         controller_df.drop(columns=[c for c in ['Time_str_x', 'Time_str_y'] if c in controller_df.columns], inplace=True)
 
-    # Convert time to float in all dfs
+    return controller_df
+
+
+def load_and_merge_to_data_df(data_file_path, monitor_file_path_list, settings_file_path_list, 
+                              save_name='merged_df.pickle', save_directory='.', overwrite=False, keep_every = 1):
+    """
+    Load and merge monitor and settings data from CSV files, and combine with waveform data. 
+    Drops NaN values and saves the merged DataFrame to a pickle file.
+    
+    Parameters
+    ----------
+    monitor_file_path_list : list of str
+        Paths to the monitor CSV files
+    settings_file_path_list : list of str
+        Paths to the settings CSV files
+    data_file_path : str
+        Path to the data pickle file
+    save_name : str, optional
+        Name of the pickle file to save (default: 'merged_df.pickle')
+    save_directory : str, optional
+        Directory to save the pickle file (default: '.')
+    overwrite : bool, optional
+        Whether to overwrite existing pickle file (default: False)
+    keep_every : int, optional
+        Keep every nth row from waveform data (default: 1)
+    
+    Returns
+    -------
+    merged_df : pd.DataFrame
+        The merged DataFrame containing waveform and controller data.
+    """
+    # check if the merged pickle file already exists. If it does, print an error message and exit early
+    if os.path.isfile(f'{save_directory}/{save_name}'):
+        if not overwrite:
+            print(f"File already exists. Load the existing pickle file instead: {save_directory}/{save_name}")
+            return pd.read_pickle(f'{save_directory}/{save_name}')
+        
+    print('loading waveform...')
+    data = pj.loadPickle(data_file_path)
+    measurements = {k:v for k,v in data.items() if isinstance(k, int)}
+    waveform_df = pd.DataFrame(measurements).transpose() 
+    waveform_df.drop(columns=['time'], inplace=True)
+
+    # Convert time to float 
     waveform_df['time_collected'] = waveform_df['time_collected'].astype(float)
     waveform_df = waveform_df.sort_values('time_collected').reset_index(drop=True)
-    controller_monitor_df['Time'] = controller_monitor_df['Time'].astype(float)
-    controller_settings_df['Time'] = controller_settings_df['Time'].astype(float)
-    controller_settings_df['Time'] = controller_settings_df['Time'].astype(float)
+    waveform_df = waveform_df.iloc[::keep_every]
 
-    ## Merge waveform and controller data
+    controller_df = load_merge_to_controller_df(monitor_file_path_list, settings_file_path_list,
+                                               monitor_cols = [ 'Time', 'Milliseconds',
+                                                            '1000.1: CH1 Object', '1000.2: CH2 Object', 
+                                                            '1001.1: CH1 Sink', '1001.2: CH2 Sink',
+                                                            '1045.1: HR1 Temp', '1045.2: HR2 Temp',
+                                                            '1044.1: LR1 Temp', '1044.2: LR2 Temp', '1044.3: LR3 Temp',
+                                                            '3000.1: CH1 Target', '3000.2: CH2 Target' ],
+                                               settings_cols = [ 'Time', 'Milliseconds',
+                                                            '2010.1: Output Enable', '2010.2: Output Enable', 
+                                                            '3034.1: Peltier Polarity', '3034.2: Peltier Polarity',
+                                                            '1200.1: Temperature is Stable','1200.2: Temperature is Stable', ], 
+                                               )
+
+    print('merging waveform and controller data...')
     merged_df = pd.merge_asof(
-        left=waveform_df,
-        right=controller_df,
-        left_on='time_collected',
-        right_on='Time',
-        direction='nearest' 
-    )
+                            left=waveform_df,
+                            right=controller_df,
+                            left_on='time_collected',
+                            right_on='Time',
+                            direction='nearest' 
+                            )
 
     ## reformat time Time_str to '%m/%d/%y %H:%M:%S'
     merged_df['Time_str'] = pd.to_datetime(merged_df['Time_str']).dt.strftime('%m/%d/%y %H:%M:%S')
@@ -175,15 +278,92 @@ def load_and_merge_to_data_df(data, monitor_file_path_list, settings_file_path_l
     ##get rid of nans
     merged_df = merged_df.dropna()
     
-    ## save merged dataframe to csv
-    if overwrite: merged_df.to_csv(f'{save_directory}/{saveName}.csv')
-    else: merged_df.to_csv(f'{save_directory}/{saveName}.csv', mode='a', header=False)  
+    ## write metadata
+    merged_df.attrs['time'] = data[0]['time']
+    merged_df.attrs['save_directory'], merged_df.attrs['save_name'] = save_directory, save_name
     
+    print('saving merged dataframe to pickle...')
+    merged_df.to_pickle(f'{save_directory}/{save_name}')
+
+    print('complete')
     return merged_df
 
 
-### calculations
 
+def preprocess_worker(x, offset, sos, correct_gain=True, butterworth_filter=True, n1_1_scaling=False, bkg_subtraction=False):
+    if correct_gain: x = pj.correctVoltageByGain(x, offset)
+    if butterworth_filter: x = sosfiltfilt(sos, x)
+    if n1_1_scaling: x = x / np.max(np.abs(x))
+    if bkg_subtraction: x = x - np.mean(x[:50])
+    return x
+
+def preprocess_merged_df(merged_df, correct_gain=True, butterworth_filter=True, n1_1_scaling=False, bkg_subtraction=False):
+    '''
+    Preprocess the merged dataframe in place.
+    
+    Parameters
+    ----------
+    merged_df : pd.DataFrame
+        The merged DataFrame containing waveform and controller data
+    correct_gain : bool, optional
+        Whether to apply gain correction (default is True)
+    butterworth_filter : bool, optional
+        Whether to apply a Butterworth high-pass filter (default is True)
+    n1_1_scaling : bool, optional
+        Whether to normalize the voltage to [-1, 1] (default is False)
+    bkg_subtraction : bool, optional
+        Whether to subtract the background noise (default is False)
+        
+    Returns
+    -------
+    pd.DataFrame
+        The preprocessed DataFrame
+    '''
+    if merged_df.attrs.get('preprocessed', False):
+        print("Warning: The merged dataframe has already been preprocessed. Skipping preprocessing.")
+        return merged_df
+    
+    keys = merged_df.columns[np.where(merged_df.columns.str.startswith('voltage_'))]
+    offset_keys = ['voltageOffsetForward', 'voltageOffsetForward', 'voltageOffsetReverse', 'voltageOffsetReverse']
+    sos = butter(5, 1000000, btype = 'highpass', analog = False, fs = 500000000, output = 'sos')
+    
+    for i, k in tqdm(enumerate(keys), total=len(keys), desc='Preprocessing waveforms'):
+        with ProcessPoolExecutor(max_workers=4) as executor:        
+            result = list( executor.map(preprocess_worker, merged_df[k], merged_df[offset_keys[i]]/10, itertools.repeat(sos), itertools.repeat(correct_gain), itertools.repeat(butterworth_filter), itertools.repeat(n1_1_scaling), itertools.repeat(bkg_subtraction)) )
+            merged_df[k] = result
+            
+    merged_df.attrs['preprocessed'] = True
+    # merged_df.to_pickle(f"{merged_df.attrs['save_directory']}/{merged_df.attrs['save_name']}")
+    return merged_df
+
+
+def load_and_merge_all_controller_columns(merged_filtered_df, monitor_file_path_list, settings_file_path_list):
+    mask = merged_filtered_df.map(lambda x: isinstance(x, (list, np.ndarray, tuple))).any(axis=0) # arrays
+    monitor_df = merged_filtered_df.drop(mask.index[mask], axis=1).copy() # drop arrays
+    controller_df = load_merge_to_controller_df(monitor_file_path_list, settings_file_path_list)
+
+    full_monitor_df = pd.merge_asof(
+        left=monitor_df,
+        right=controller_df,
+        left_on='time_collected',
+        right_on='Time',
+        direction='nearest' )
+
+    # non unique columns aren't informative
+    non_unique_cols = [c for c in full_monitor_df.columns if len(full_monitor_df[c].unique()) == 1] 
+    full_monitor_df.drop(columns=non_unique_cols, inplace=True)
+
+    full_monitor_df.drop(['Time_str', 'Time_str_x', 'Time_str_y'], axis=1, inplace=True) # drop non-numeric time
+
+    # mask = full_monitor_df.map(lambda x: isinstance(x, (str))).any(axis=0)
+    # str_df = full_monitor_df.loc[:, mask]
+    
+    return full_monitor_df
+
+
+
+### calculations
+## TODO: find a way to speed up and parallelize
 def calculate_mean_diff(merged_df):
     '''Calculate the mean and difference of temperatures from the merged dataframe.'''
     merged_df['index'] = merged_df.index
@@ -192,14 +372,76 @@ def calculate_mean_diff(merged_df):
     return merged_df
 
 
+def feature_worker(x, t_):
+        return {
+            "amplitude": pj.maxMinusMin(x),
+            "Hilbert_ToF": pj.envelopeThresholdTOF(x, t_, 0.15),
+            "Hilbert_noise_ToF": pj.firstIndexAboveNoise(x),
+            "max": max(abs(x)),
+        }
+        
 def calculate_waveform_features(merged_df):
     '''Calculate waveform features from the merged dataframe.'''
-    for key_ in ['_forward', '_reverse']:    
-        merged_df['amplitude'+key_+' (mV)'] = list(map(pj.maxMinusMin, merged_df['voltage_transmission'+key_]))
-        merged_df['Hilbert_ToF'+key_+' (ns)'] = list(map(pj.envelopeThresholdTOF, merged_df['voltage_transmission'+key_], merged_df['time'], [0.15,] * len(merged_df)))
-        merged_df['Hilbert_noise_Tof'+key_+' (ns)'] = list(map(pj.firstIndexAboveNoise, merged_df['voltage_transmission'+key_]))
-        merged_df['max'+key_+' (mV)'] = list(map(lambda x: max(abs(x)), merged_df['voltage_transmission'+key_]))
+    keys = merged_df.columns[np.where(merged_df.columns.str.startswith('voltage_'))]
+    t_ = merged_df.attrs['time']
+
+    for k in tqdm(keys, total=len(keys), desc='Calculating waveform features'):
+        if k not in merged_df.columns:
+            print(f"Skipping: {k} not found in merged_df columns.")
+            continue
+    
+        with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
+            results = list(executor.map(feature_worker, merged_df[k], itertools.repeat(t_)))
+            
+            merged_df['amplitude_'+k+' (mV)'] = [r['amplitude'] for r in results]
+            merged_df['Hilbert_ToF_'+k+' (ns)'] = [r['Hilbert_ToF'] for r in results]
+            merged_df['Hilbert_noise_Tof_'+k+' (ns)'] = [r['Hilbert_noise_ToF'] for r in results]
+            merged_df['max_'+k+' (mV)'] = [r['max'] for r in results]
+
     return merged_df
+
+
+def frequency_worker(x, f_, f_len):
+    fft_val = np.fft.fftshift(np.fft.fft(x))
+    magnitude = np.abs(fft_val) / f_len
+    phase = np.unwrap(np.angle(fft_val))
+    group_delay = -np.gradient(phase, f_) / 2 / np.pi
+    hilbert = pj.hilbertEnvelope(x)
+    return {
+        "fft": fft_val,
+        "magnitude": magnitude,
+        "phase": phase,
+        "group_delay": group_delay,
+        "hilbert": hilbert,
+    }
+    
+def calculate_frequency_features(merged_df):
+    '''Calculate fft features from the merged dataframe.'''
+    keys = merged_df.columns[np.where(merged_df.columns.str.startswith('voltage_'))]
+    f_ = np.fft.fftshift( np.fft.fftfreq( len(merged_df.attrs['time']), d=(merged_df.attrs['time'][1] - merged_df.attrs['time'][0])))
+    merged_df.attrs['freq'] = f_
+    f_len = len(merged_df.attrs['freq'])
+
+        
+    for k in tqdm(keys):
+        if k not in merged_df.columns:
+            print(f"Skipping: {k} not found in merged_df columns.")
+            continue
+        
+        with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
+            print('execute')
+            results = list(executor.map(frequency_worker, merged_df[k], itertools.repeat(f_), itertools.repeat(f_len)))
+            
+            print('filling')
+            merged_df['fft_'+k] = [r['fft'] for r in results]
+            merged_df['fft_magnitude_'+k] = [r['magnitude'] for r in results]
+            merged_df['fft_phase_'+k] = [r['phase'] for r in results]
+            merged_df['fft_group_delay_'+k] = [r['group_delay'] for r in results]
+            merged_df['Hilbert_window_'+k] = [r['hilbert'] for r in results]
+       
+    return merged_df
+
+
 
 # TODO: test
 def detrend_linear(df, keys=None):
@@ -209,6 +451,7 @@ def detrend_linear(df, keys=None):
     Parameters:
     - df: pandas.DataFrame, the filtered dataframe to detrend
     - amplitude_keys: list of str, column names for amplitude data to detrend (default: forward and reverse)    
+    - tof_keys: list of str, column names for ToF data to detrend (default: Hilbert and Simple ToF)
     Returns:
     - df: pandas.DataFrame, the detrended dataframe (modifies in place)
     """
@@ -248,6 +491,50 @@ def detrend_log(df, amplitude_keys=None, tof_keys=None):
         df[k] -= fit
     
     return df
+
+
+def calculate_avgs_by_T(merged_filtered_df, temps, crop=None, polyfit_degree=1,
+                        keys_=['amplitude_forward (mV)', 
+                                'amplitude_reverse (mV)', 
+                                'Hilbert_ToF_forward (ns)', 
+                                'Hilbert_ToF_reverse (ns)'], ):
+    avgs = {k: [] for k in keys_}
+    errs = {k: [] for k in keys_}
+    params, fits, residuals = {}, {}, {}
+    
+    T_fits_df = pd.DataFrame({'calculated': keys_,
+                              'avg': [[] for _ in keys_],
+                              'err': [[] for _ in keys_],
+                              'params': [[] for _ in keys_],
+                              'fits': [[] for _ in keys_],
+                              'residuals': [[] for _ in keys_]}).set_index('calculated')
+                             
+    T_fits_df.attrs = {'dT': [abs(t[0] - t[1]) for t in temps],
+                       'T_avg': [np.mean(t) for t in temps]}
+    
+    for k in keys_:
+        for t in temps:
+            mask = ( (merged_filtered_df['3000.1: CH1 Target'] == t[0])
+                    & (merged_filtered_df['3000.2: CH2 Target'] == t[1])
+                    & (merged_filtered_df['2010.1: Output Enable'] == 'ON')
+                    & (merged_filtered_df['2010.2: Output Enable'] == 'ON') )    
+            if crop: mask+=( (merged_filtered_df.index >= crop[0]) & (merged_filtered_df.index < crop[1]) )
+                
+            if mask.sum() == 0: 
+                print(f"No data found for temperature {t}. Skipping this temperature.")
+                continue
+            
+            filtered_df = merged_filtered_df[mask]
+            T_fits_df.loc[k,'avg'].append(filtered_df[k].mean())
+            T_fits_df.loc[k,'err'].append(filtered_df[k].std())
+            
+        T_fits_df.loc[k,'params'] = np.polyfit(T_fits_df.attrs['dT'], T_fits_df.loc[k,'avg'], polyfit_degree)
+        T_fits_df.loc[k,'fits'] = np.polyval(T_fits_df.loc[k,'params'], T_fits_df.attrs['dT'])
+        T_fits_df.loc[k,'residuals'] = T_fits_df.loc[k,'avg'] - T_fits_df.loc[k,'fits']
+        
+    return T_fits_df
+
+
 
 
 
@@ -328,11 +615,13 @@ def plot_detrended_tof(merged_df):
     plt.tight_layout()
     plt.show()
 
+
+
 def waveform_interact_decorator(func):
     def wrapper(*args, **kwargs):
-        merged_df = kwargs.get('merged_df', None)
+        merged_df = kwargs.pop('merged_df', None)
         if merged_df is None: raise ValueError("merged_df is required")
-        max_ = merged_df['max_forward (mV)'].max()
+        max_ = kwargs.pop('max_', None)
         
         slider = widgets.IntSlider(value=0,
                                     min=0, max=len(merged_df)-1,
@@ -340,30 +629,84 @@ def waveform_interact_decorator(func):
                                     description='measurement:',
                                     continuous_update=False
                                 )
-        function = lambda i: func(i, merged_df, max_)
+        function = lambda i: func(i, merged_df, max_, **kwargs)
         interact(function, i=slider)
     return wrapper
 
 @waveform_interact_decorator
-def plot_waveform(i, merged_df=None, max_=None):
+def plot_waveform(i, merged_df=None, max_=None, keys=None):
+    if not keys:
+        keys = merged_df.columns[np.where(merged_df.columns.str.startswith('voltage_'))]
+    
     fig,ax = plt.subplots(figsize=(8, 4))
             
-    ax.plot(merged_df['time'][i], merged_df['voltage_transmission_forward'][i], lw=1, label='forward')
-    ax.vlines(merged_df['Hilbert_ToF_forward (ns)'][i], -max_, max_, color='blue', lw=1, linestyles='--', label='Hilbert ToF forward')
+    for key_ in keys:
+        ax.plot(merged_df.attrs['time'], merged_df[key_][i], lw=1, label=key_)
     
-    ax.plot(merged_df['time'][i], merged_df['voltage_transmission_reverse'][i], lw=1, label='reverse')
-    ax.vlines(merged_df['Hilbert_ToF_reverse (ns)'][i], -max_, max_, color='green', lw=1, linestyles='--', label='Hilbert ToF reverse')
-    
-    
-    ax.set_title(f'Measurement {i} at ({merged_df["Time_str"][i]})')
+    ax.set_title(f'{i}: ({merged_df["Time_str"][i]}), (F, R)=({merged_df["1000.1: CH1 Object"][i]:.2f}, {merged_df["1000.2: CH2 Object"][i]:.2f})ºC ')
     ax.set_ylim(-max_, max_)
     ax.set_xlabel('Time (ns)')
-    ax.set_ylabel('Voltage Normalized')
+    ax.set_ylabel('Voltage (mV)')
     
     fig.legend(loc='upper center', bbox_to_anchor=(0.5, 0.05), ncol=2)
     fig.tight_layout()
-  
+    
+@waveform_interact_decorator
+def plot_hilbert(i, merged_df=None, max_=None):
+    keys = merged_df.columns[np.where(merged_df.columns.str.startswith('voltage_'))]
+    
+    fig,ax = plt.subplots(figsize=(8, 4))
+            
+    for key_ in keys:
+        ax.plot(merged_df.attrs['time'], merged_df[key_][i], lw=1, label=key_)
+        ax.plot(merged_df.attrs['time'], merged_df['Hilbert_window_'+key_][i], lw=0.5, linestyle='--', color=ax.lines[-1].get_color())
+    
+    ax.set_title(f'{i}: ({merged_df["Time_str"][i]}), (F, R)=({merged_df["1000.1: CH1 Object"][i]:.2f}, {merged_df["1000.2: CH2 Object"][i]:.2f})ºC ')
+    ax.set_ylim(-max_, max_*1.1)
+    ax.set_xlabel('Time (ns)')
+    ax.set_ylabel('Voltage (mV)')
+    
+    fig.legend(loc='upper center', bbox_to_anchor=(0.5, 0.05), ncol=2)
+    fig.tight_layout()
+    
+@waveform_interact_decorator
+def plot_ffts(i, merged_df=None, max_=None, freq_crop=None):
+    keys = merged_df.columns[np.where(merged_df.columns.str.startswith('voltage_'))]
+    
+    fig,ax = plt.subplots(2,2,figsize=(12, 8))
+    ax = ax.flatten()
+    fig.suptitle(f'{i}: ({merged_df["Time_str"][i]}), (F, R)=({merged_df["1000.1: CH1 Object"][i]:.2f}, {merged_df["1000.2: CH2 Object"][i]:.2f})ºC ')
+    if freq_crop is None: freq_crop = [0, len(merged_df.attrs['freq'])]
+    
+    for k in keys:
+        ax[0].plot(merged_df.attrs['time'], merged_df[k][i], label=k, lw=1)
+        ax[1].plot(merged_df.attrs['freq'][freq_crop[0]:freq_crop[1]], merged_df['fft_magnitude_'+k][i][freq_crop[0]:freq_crop[1]], lw=1)
+        ax[2].plot(merged_df.attrs['freq'][freq_crop[0]:freq_crop[1]], merged_df['fft_phase_'+k][i][freq_crop[0]:freq_crop[1]], lw=1)
+        ax[3].plot(merged_df.attrs['freq'][freq_crop[0]:freq_crop[1]], merged_df['fft_group_delay_'+k][i][freq_crop[0]:freq_crop[1]], lw=1)
+        
+    ax[0].set_title('waveform')
+    ax[0].set_xlabel('time (ns)')
+    ax[0].set_ylabel('amplitude')
+    ax[0].set_ylim(-max_, max_)
 
+    ax[1].set_title('fft')
+    ax[1].set_xlabel('frequency (1/ns)')
+    ax[1].set_ylabel('magnitude')
+    # ax[1].set_ylim(0, max_)
+    # ax[1].plot(freq[freq_crop[0]:freq_crop[1]], fft_summed_morlet_mag[freq_crop[0]:freq_crop[1]], label='summed morlet', linestyle='--')
+
+    ax[2].set_title('phase')
+    ax[2].set_xlabel('frequency (1/ns)')
+    ax[2].set_ylabel('phase (rad)')
+
+    ax[3].set_title('group delay')
+    ax[3].set_xlabel('frequency (1/ns)')
+    ax[3].set_ylabel('group delay (ns)')
+
+    fig.legend(loc='upper center', bbox_to_anchor=(0.5, 0.03), ncol=2)
+    fig.tight_layout()
+     
+ 
 def experimental_data_interact_decorator(func):
     def wrapper(*args, **kwargs):
         df = kwargs.get('df', None)
@@ -490,4 +833,153 @@ def plot_experimental_data(i=0, keys_=(), df=None, idx_label_type='', x_scaling=
     #             blocks = np.split(highlight_indices, np.where(np.diff(highlight_indices) != 1)[0] + 1)
     #             for block in blocks:
     #                 ax1.axvspan(xticks[block.min()], xticks[block.max()], color='gray', alpha=0.15)
+
+
+def format_polyfit_params(T_fits_df, k, t_type):
+    if T_fits_df.loc[k,"params"].shape[0] == 1:
+        return f'{T_fits_df.loc[k,"params"][-1]:.2f}'
+    if T_fits_df.loc[k,"params"].shape[0] > 1:
+        fstring_list = [ f'{T_fits_df.loc[k,"params"][-1]:.2f}', f'{T_fits_df.loc[k,"params"][-2]:.2f}{t_type}' ]
+    for i,p in enumerate(T_fits_df.loc[k,"params"][:-2]):
+        fstring_list.append(f'{p:.2f}{t_type}^{len(T_fits_df.loc[k,"params"])-i-1}')
+    
+    direction =  k.split(' ')[0].split('_')[-1]
+    
+    return direction + ': '+ ' + '.join(fstring_list)
+
+def plot_avg_fits(T_fits_df, suptitle, t_type, keys, title, y_label):
+    s = T_fits_df.shape
+    fig, ax = plt.subplots(1,2, figsize=(10,5))
+    fig.suptitle(suptitle)
+
+    for k in keys:
+        ax[0].plot(T_fits_df.attrs[t_type], T_fits_df.loc[k,'fits'], 
+                linewidth=1, linestyle='--', label=format_polyfit_params(T_fits_df, k, t_type))
+        ax[0].errorbar(T_fits_df.attrs[t_type], T_fits_df.loc[k,'avg'], yerr=T_fits_df.loc[k,'err'], 
+                    fmt='o', markersize=5, capsize=3, label=f'1 StDv', color=ax[0].lines[-1].get_color(), ecolor=ax[0].lines[-1].get_color())
+
+
+        ax[1].plot(T_fits_df.attrs[t_type], T_fits_df.loc[k, 'residuals'], linewidth=1, linestyle='--')
+        ax[1].errorbar(T_fits_df.attrs[t_type], T_fits_df.loc[k, 'residuals'], yerr=T_fits_df.loc[k, 'err'], 
+                       fmt='o', markersize=5, color=ax[0].lines[-1].get_color(), ecolor=ax[0].lines[-1].get_color(), capsize=3)
+
+        # ax[1].plot(T_fits_df.attrs[t_type], T_fits_df.loc[k_forward.replace('forward', 'reverse'), 'residuals'], color='green', linewidth=1, linestyle='--',)
+        # ax[1].errorbar(T_fits_df.attrs[t_type], T_fits_df.loc[k_forward.replace('forward', 'reverse'), 'residuals'], yerr=T_fits_df.loc[k_forward.replace('forward', 'reverse'), 'err'], fmt='s', markersize=5, color='green', ecolor='green', capsize=3,)
+
+    ax[0].set_title(title)
+    ax[0].set_xlabel(t_type+' (ºC)')
+    ax[0].set_ylabel(y_label)
+    
+    ax[1].set_title('Residuals')
+    ax[1].set_xlabel(t_type+' (ºC)')
+    ax[1].set_ylabel('Residuals')
+
+    fig.legend(loc='lower center', bbox_to_anchor=(0.5, -0.14), ncol=2)
+
+    fig.tight_layout()    
+    
+
+def plot_overall_waveforms(merged_filtered_df, temps, key, crop=None, t_type='dT'):
+    '''
+    Plot overall waveforms for a given key and temperature range.
+
+    Parameters:
+    merged_filtered_df (pd.DataFrame): The filtered DataFrame.
+    temps (list): A list of temperature tuples.
+    key (str): The key to plot.
+    crop (tuple, optional): A tuple of start and end indices to crop the data.
+    t_type (str, optional): The type of temperature to display. Defaults to 'dT'. options: ['T', 'dT', 'Both']
+
+    Returns:
+    None
+    
+    '''
+    
+    if not crop or len(crop) != 2:
+        crop = (0, len(merged_filtered_df.attrs['time']))
+        
+    fig, ax = plt.subplots(figsize=(7.5, 4))
+    
+    for i, t in enumerate(temps):
+        mask = ( (merged_filtered_df['3000.1: CH1 Target'] == t[0])
+                & (merged_filtered_df['3000.2: CH2 Target'] == t[1])
+                & (merged_filtered_df['2010.1: Output Enable'] == 'ON')
+                & (merged_filtered_df['2010.2: Output Enable'] == 'ON') )
+            
+        if mask.sum() == 0: 
+            print(f"No data found for temperature {t}. Skipping this temperature.")
+            continue
+        
+        temp_df = merged_filtered_df.loc[mask].iloc[::50]
+        
+        for idx, row in temp_df.iterrows():
+            ax.plot(
+                merged_filtered_df.attrs['time'][crop[0]:crop[1]],
+                row[key][crop[0]:crop[1]],
+                color=cm.viridis(i / (len(temps)-1)),
+                linewidth=0.5,
+                alpha=0.7,
+                label=f'20 +/-ΔT' if idx == temp_df.index[-1] else None
+            )
+            
+    ax.set_xlabel('Time (ns)')
+    ax.set_ylabel('Voltage (mV)')
+    fig.tight_layout()
+    fig.subplots_adjust(right=0.78)
+    
+    if t_type == 'dT':
+        ax.set_title(f'{key} 20 +/-ΔT')
+        cax1 = fig.add_axes([0.81, 0.15, 0.02, 0.7])
+        sm1 = plt.cm.ScalarMappable(cmap=cm.viridis, norm=plt.Normalize(vmin=merged_filtered_df['diff_T (°C)'].min(), 
+                                                                        vmax=merged_filtered_df['diff_T (°C)'].max()))
+        cbar1 = fig.colorbar(sm1, cax=cax1)
+        cbar1.ax.set_title('ΔT', pad=10)
+    elif t_type == 'T':
+        ax.set_title(f'{key}')
+        cax1 = fig.add_axes([0.81, 0.15, 0.02, 0.7])
+        sm1 = plt.cm.ScalarMappable(cmap=cm.viridis, norm=plt.Normalize(vmin=merged_filtered_df['mean_T (°C)'].min(), 
+                                                                        vmax=merged_filtered_df['mean_T (°C)'].max()))
+        cbar1 = fig.colorbar(sm1, cax=cax1)
+        cbar1.ax.set_title('T', pad=10)
+    elif t_type == 'Both':
+        cax1 = fig.add_axes([0.81, 0.15, 0.02, 0.7])
+        sm1 = plt.cm.ScalarMappable(cmap=cm.viridis, norm=plt.Normalize(vmin=merged_filtered_df['diff_T (°C)'].min(), 
+                                                                        vmax=merged_filtered_df['diff_T (°C)'].max()))
+        cbar1 = fig.colorbar(sm1, cax=cax1)
+        cbar1.ax.set_title('ΔT', pad=10)
+
+        cax2 = fig.add_axes([0.91, 0.15, 0.02, 0.7])
+        sm2 = plt.cm.ScalarMappable(cmap=cm.viridis, norm=plt.Normalize(vmin=merged_filtered_df['mean_T (°C)'].min(), 
+                                                                        vmax=merged_filtered_df['mean_T (°C)'].max()))
+        cbar2 = fig.colorbar(sm2, cax=cax2)
+        cbar2.ax.set_title('T', pad=10)    
+    
+    
+
+## PCA and stat analysis
+    
+def plot_pca_variance(X_scaled, components=15):
+    
+    pca = PCA(n_components=components)
+    transformed = pca.fit_transform(X_scaled)
+    
+    fig, ax = plt.subplots()
+    x = np.arange(1, components + 1)
+    explained = pca.explained_variance_ratio_
+    cumulative = np.cumsum(explained)
+
+    ax.plot(x, explained, marker='o', label='explained variance of component')
+    for xi, ex in zip(x, explained):  ax.text(xi, ex + 0.02, f'{ex:.2%}', ha='center', va='bottom', rotation=90, fontsize=8)
+
+    ax.plot(x, cumulative, marker='s', linestyle='--', label='cumulative explained variance')
+    for xi, cum in zip(x, cumulative):  ax.text(xi, cum + 0.02, f'{cum:.2%}', ha='center', va='bottom', rotation=90, fontsize=8)
+
+    ax.set_title('Explained Variance of Principal Components')
+    ax.set_xlabel('Principal Component Number')
+    ax.set_ylabel('Explained Variance Ratio')
+    ax.set_ylim(0, 1.25)
+    ax.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
+    fig.legend(loc='lower center', ncol=1, bbox_to_anchor=(0.5, -0.2), frameon=False)   
+    
+    
     
