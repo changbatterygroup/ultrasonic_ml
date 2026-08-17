@@ -30,7 +30,7 @@ import ipywidgets as widgets
 from mpire import WorkerPool
 from tqdm import tqdm
 
-
+## TODO: is it better to have h5 files instead?
 
 
 ### data
@@ -280,6 +280,8 @@ def load_and_merge_to_data_df(data_file_path, monitor_file_path_list, settings_f
     
     ## write metadata
     merged_df.attrs['time'] = data[0]['time']
+    merged_df.attrs['freq'] = np.fft.fftshift( np.fft.fftfreq( len(merged_df.attrs['time']), d=(merged_df.attrs['time'][1] - merged_df.attrs['time'][0])))
+
     merged_df.attrs['save_directory'], merged_df.attrs['save_name'] = save_directory, save_name
     
     print('saving merged dataframe to pickle...')
@@ -297,7 +299,7 @@ def preprocess_worker(x, offset, sos, correct_gain=True, butterworth_filter=True
     if bkg_subtraction: x = x - np.mean(x[:50])
     return x
 
-def preprocess_merged_df(merged_df, correct_gain=True, butterworth_filter=True, n1_1_scaling=False, bkg_subtraction=False):
+def preprocess_merged_df(merged_df, correct_gain=True, butterworth_filter=True, n1_1_scaling=False, bkg_subtraction=False, save_to_pickle=True):
     '''
     Preprocess the merged dataframe in place.
     
@@ -328,12 +330,16 @@ def preprocess_merged_df(merged_df, correct_gain=True, butterworth_filter=True, 
     sos = butter(5, 1000000, btype = 'highpass', analog = False, fs = 500000000, output = 'sos')
     
     for i, k in tqdm(enumerate(keys), total=len(keys), desc='Preprocessing waveforms'):
-        with ProcessPoolExecutor(max_workers=4) as executor:        
+        with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:        
             result = list( executor.map(preprocess_worker, merged_df[k], merged_df[offset_keys[i]]/10, itertools.repeat(sos), itertools.repeat(correct_gain), itertools.repeat(butterworth_filter), itertools.repeat(n1_1_scaling), itertools.repeat(bkg_subtraction)) )
             merged_df[k] = result
             
     merged_df.attrs['preprocessed'] = True
-    # merged_df.to_pickle(f"{merged_df.attrs['save_directory']}/{merged_df.attrs['save_name']}")
+    
+    if save_to_pickle:
+        print('Saving preprocessed dataframe to pickle...')
+        merged_df.to_pickle(f"{merged_df.attrs['save_directory']}/{merged_df.attrs['save_name']}")
+
     return merged_df
 
 
@@ -364,11 +370,22 @@ def load_and_merge_all_controller_columns(merged_filtered_df, monitor_file_path_
 
 ### calculations
 ## TODO: find a way to speed up and parallelize
-def calculate_mean_diff(merged_df):
+def calculate_mean_diff(merged_df, overwrite=False, save_to_pickle=False):
     '''Calculate the mean and difference of temperatures from the merged dataframe.'''
+    
+    if merged_df.attrs.get('mean_diff_calculations', False) and not overwrite:
+        print("Warning: The merged dataframe has already had mean and difference of temperatures calculated. Skipping calculation.")
+        return merged_df
+    
     merged_df['index'] = merged_df.index
     merged_df['mean_T (°C)'] = merged_df[['1000.1: CH1 Object', '1000.2: CH2 Object']].mean(axis=1)
     merged_df['diff_T (°C)'] = merged_df['1000.1: CH1 Object'] - merged_df['1000.2: CH2 Object']
+    
+    merged_df.attrs['mean_diff_calculations'] = True
+    
+    if save_to_pickle:
+        print('Saving mean and difference of temperatures to pickle...')
+        merged_df.to_pickle(f"{merged_df.attrs['save_directory']}/{merged_df.attrs['save_name']}")
     return merged_df
 
 
@@ -378,18 +395,20 @@ def feature_worker(x, t_):
             "Hilbert_ToF": pj.envelopeThresholdTOF(x, t_, 0.15),
             "Hilbert_noise_ToF": pj.firstIndexAboveNoise(x),
             "max": max(abs(x)),
+            "hilbert": pj.hilbertEnvelope(x),
         }
         
-def calculate_waveform_features(merged_df):
+def calculate_waveform_features(merged_df, overwrite=False, save_to_pickle=False):
     '''Calculate waveform features from the merged dataframe.'''
+    
+    if merged_df.attrs.get('waveform_features_calculated', False) and not overwrite:
+        print("Warning: The merged dataframe has already had waveform features calculated. Skipping calculation.")
+        return merged_df
+    
     keys = merged_df.columns[np.where(merged_df.columns.str.startswith('voltage_'))]
     t_ = merged_df.attrs['time']
 
     for k in tqdm(keys, total=len(keys), desc='Calculating waveform features'):
-        if k not in merged_df.columns:
-            print(f"Skipping: {k} not found in merged_df columns.")
-            continue
-    
         with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
             results = list(executor.map(feature_worker, merged_df[k], itertools.repeat(t_)))
             
@@ -397,52 +416,133 @@ def calculate_waveform_features(merged_df):
             merged_df['Hilbert_ToF_'+k+' (ns)'] = [r['Hilbert_ToF'] for r in results]
             merged_df['Hilbert_noise_Tof_'+k+' (ns)'] = [r['Hilbert_noise_ToF'] for r in results]
             merged_df['max_'+k+' (mV)'] = [r['max'] for r in results]
+            merged_df['Hilbert_window_'+k] = [r['hilbert'] for r in results]
+
+    merged_df.attrs['waveform_features_calculated'] = True
+
+    if save_to_pickle:
+        print('Saving waveform features to pickle...')
+        merged_df.to_pickle(f"{merged_df.attrs['save_directory']}/{merged_df.attrs['save_name']}")
 
     return merged_df
 
 
-def frequency_worker(x, f_, f_len):
+def fft_magnitude_worker(x, f_len):
+    '''worker for calculating FFT and magnitude
+    Parameters
+    ----------
+    x : array-like
+        The input signal
+    f_len : int
+        The length of the frequency domain
+    Returns
+    -------
+    dict
+        A dictionary containing the FFT and magnitude
+    '''
     fft_val = np.fft.fftshift(np.fft.fft(x))
     magnitude = np.abs(fft_val) / f_len
-    phase = np.unwrap(np.angle(fft_val))
-    group_delay = -np.gradient(phase, f_) / 2 / np.pi
-    hilbert = pj.hilbertEnvelope(x)
     return {
         "fft": fft_val,
         "magnitude": magnitude,
-        "phase": phase,
-        "group_delay": group_delay,
-        "hilbert": hilbert,
     }
-    
-def calculate_frequency_features(merged_df):
-    '''Calculate fft features from the merged dataframe.'''
-    keys = merged_df.columns[np.where(merged_df.columns.str.startswith('voltage_'))]
-    f_ = np.fft.fftshift( np.fft.fftfreq( len(merged_df.attrs['time']), d=(merged_df.attrs['time'][1] - merged_df.attrs['time'][0])))
-    merged_df.attrs['freq'] = f_
-    f_len = len(merged_df.attrs['freq'])
 
-        
-    for k in tqdm(keys):
-        if k not in merged_df.columns:
-            print(f"Skipping: {k} not found in merged_df columns.")
-            continue
-        
+def calculate_fft_magnitude_features(merged_df, overwrite=False, save_to_pickle=False):
+    '''Calculate fft and fft magnitude features from the merged dataframe.'''
+
+    if merged_df.attrs.get('fft_magnitude_features_calculated', False) and not overwrite:
+        print("Warning: The merged dataframe has already had fft magnitude features calculated. Skipping calculation.")
+        return merged_df
+
+    keys = merged_df.columns[np.where(merged_df.columns.str.startswith('voltage_'))]
+    f_len = len(merged_df.attrs['time'])
+
+    for k in tqdm(keys, desc='Calculating FFT and magnitude'):
         with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
-            print('execute')
-            results = list(executor.map(frequency_worker, merged_df[k], itertools.repeat(f_), itertools.repeat(f_len)))
-            
-            print('filling')
+            results = list(executor.map(fft_magnitude_worker, merged_df[k], itertools.repeat(f_len)))
+
             merged_df['fft_'+k] = [r['fft'] for r in results]
             merged_df['fft_magnitude_'+k] = [r['magnitude'] for r in results]
-            merged_df['fft_phase_'+k] = [r['phase'] for r in results]
-            merged_df['fft_group_delay_'+k] = [r['group_delay'] for r in results]
-            merged_df['Hilbert_window_'+k] = [r['hilbert'] for r in results]
-       
+
+    merged_df.attrs['fft_magnitude_features_calculated'] = True
+
+    if save_to_pickle:
+        print('Saving waveform features to pickle...')
+        merged_df.to_pickle(f"{merged_df.attrs['save_directory']}/{merged_df.attrs['save_name']}")
+
     return merged_df
 
 
+def phase_group_delay_worker(x, f_):
+    '''worker for calculating phase and group delay
+    Parameters
+    ----------
+    x : array-like
+        The input signal
+    f_ : array-like
+        The frequency domain
+    Returns
+    -------
+    dict
+        A dictionary containing the phase and group delay
+    '''
+    phase = np.unwrap(np.angle(x))
+    group_delay = -np.gradient(phase, f_) / 2 / np.pi
+    return {
+        "phase": phase,
+        "group_delay": group_delay,
+    }
 
+def calculate_phase_group_delay_features(merged_df, overwrite=False, save_to_pickle=False):
+    '''Calculate fft phase and group delay features from the merged dataframe.'''
+
+    if merged_df.attrs.get('phase_group_delay_features_calculated', False) and not overwrite:
+        print("Warning: The merged dataframe has already had frequency phase and group delay features calculated. Skipping calculation.")
+        return merged_df
+
+    keys = merged_df.columns[np.where(merged_df.columns.str.startswith('voltage_'))]
+    f_ = merged_df.attrs['freq']
+
+    for k in tqdm(keys, desc='Calculating phase and group delay'):
+        with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
+            results = list(executor.map(phase_group_delay_worker, merged_df[k], itertools.repeat(f_)))
+
+            merged_df['fft_phase_'+k] = [r['phase'] for r in results]
+            merged_df['fft_group_delay_'+k] = [r['group_delay'] for r in results]
+
+    merged_df.attrs['phase_group_delay_features_calculated'] = True
+
+    if save_to_pickle:
+        print('Saving waveform features to pickle...')
+        merged_df.to_pickle(f"{merged_df.attrs['save_directory']}/{merged_df.attrs['save_name']}")
+    
+    return merged_df
+
+
+def calculate_frequency_features(merged_df, overwrite=False, save_to_pickle=False):
+    # '''Calculate fft features from the merged dataframe.'''
+    
+    # if merged_df.attrs.get('frequency_features_calculated', False) and not overwrite:
+    #     print("Warning: The merged dataframe has already had frequency features calculated. Skipping calculation.")
+    #     return merged_df
+    
+    # keys = merged_df.columns[np.where(merged_df.columns.str.startswith('voltage_'))]
+    # f_ = np.fft.fftshift( np.fft.fftfreq( len(merged_df.attrs['time']), d=(merged_df.attrs['time'][1] - merged_df.attrs['time'][0])))
+    # merged_df.attrs['freq'] = f_
+
+    # merged_df = calculate_fft_magnitude_features(merged_df)
+    # merged_df = calculate_phase_group_delay_features(merged_df)
+       
+    # if save_to_pickle:
+    #     print('Saving frequency features to pickle...')
+    #     merged_df.to_pickle(f"{merged_df.attrs['save_directory']}/{merged_df.attrs['save_name']}")
+        
+    # return merged_df
+    pass
+
+
+
+    
 # TODO: test
 def detrend_linear(df, keys=None):
     """
