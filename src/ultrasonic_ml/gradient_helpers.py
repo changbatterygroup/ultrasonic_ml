@@ -1,34 +1,34 @@
-import itertools
 import sys
 # sys.path.append('..') # path to the src directory
 # sys.path.append('/Users/xz498/Library/CloudStorage/OneDrive-DrexelUniversity/Chang Lab - Documents/General/Individual/Xinqiao Zhang/data_analysis/ultrasonicTesting/')
 
-from concurrent.futures import ProcessPoolExecutor
-
 import os
 import os.path
+
+import itertools
+from tqdm import tqdm
+from concurrent.futures import ProcessPoolExecutor
 
 import pickleJar as pj
 
 import pickle
 from datetime import datetime
-import pandas as pd
 
 import numpy as np
 from scipy.optimize import curve_fit
 from scipy.signal import butter, sosfiltfilt
 
+import pandas as pd
+
 from  sklearn.decomposition import PCA
-
-
 
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 from ipywidgets import interact
 import ipywidgets as widgets
+import plotly.graph_objects as go
 
-from mpire import WorkerPool
-from tqdm import tqdm
+
 
 ## TODO: is it better to have h5 files instead?
 
@@ -183,10 +183,12 @@ def load_merge_to_controller_df(monitor_file_path_list, settings_file_path_list,
     controller_monitor_df.sort_values('Time', inplace=True)
     controller_settings_df.sort_values('Time', inplace=True)
     
-        ## Merge monitor and settings data
+    common_cols = set(controller_monitor_df.columns) & set(controller_settings_df.columns) - {'Time'}
+
+    ## Merge monitor and settings data
     controller_df = pd.merge_asof(
         left=controller_monitor_df,
-        right=controller_settings_df,
+        right=controller_settings_df.drop(columns=common_cols),
         left_on='Time',
         right_on='Time',
         direction='nearest' 
@@ -280,7 +282,7 @@ def load_and_merge_to_data_df(data_file_path, monitor_file_path_list, settings_f
     
     ## write metadata
     merged_df.attrs['time'] = data[0]['time']
-    merged_df.attrs['freq'] = np.fft.fftshift( np.fft.fftfreq( len(merged_df.attrs['time']), d=(merged_df.attrs['time'][1] - merged_df.attrs['time'][0])))
+    merged_df.attrs['freq'] = np.fft.fftshift( np.fft.fftfreq( len(merged_df.attrs['time']), d=merged_df.attrs['time'][1] - merged_df.attrs['time'][0]))
 
     merged_df.attrs['save_directory'], merged_df.attrs['save_name'] = save_directory, save_name
     
@@ -289,6 +291,40 @@ def load_and_merge_to_data_df(data_file_path, monitor_file_path_list, settings_f
 
     print('complete')
     return merged_df
+
+
+def load_and_merge_all_controller_columns(merged_filtered_df, monitor_file_path_list, settings_file_path_list):
+    mask = merged_filtered_df.map(lambda x: isinstance(x, (list, np.ndarray, tuple))).any(axis=0) # arrays
+    monitor_df = merged_filtered_df.drop(mask.index[mask], axis=1).copy() # drop arrays
+    controller_df = load_merge_to_controller_df(monitor_file_path_list, settings_file_path_list)
+
+    common_cols = set(monitor_df.columns) & set(controller_df.columns) - {'Time', 'time_collected'}
+    
+    full_monitor_df = pd.merge_asof(
+        left=monitor_df,
+        right=controller_df.drop(columns=common_cols),
+        left_on='time_collected',
+        right_on='Time',
+        direction='nearest',
+        )
+
+    # non unique columns aren't informative
+    non_unique_cols = [c for c in full_monitor_df.columns if len(full_monitor_df[c].unique()) == 1] 
+    full_monitor_df.drop(columns=non_unique_cols, inplace=True)
+
+    time_str_cols = [c for c in ['Time_str', 'Time_str_x', 'Time_str_y'] if c in full_monitor_df.columns]
+    if time_str_cols:
+        full_monitor_df.drop(columns=time_str_cols, inplace=True)  # drop non-numeric time
+
+    # drop columns that contain any NaN values
+    full_monitor_df.dropna(axis=1, inplace=True)
+
+    # mask = full_monitor_df.map(lambda x: isinstance(x, (str))).any(axis=0)
+    # str_df = full_monitor_df.loc[:, mask]
+    
+    
+    
+    return full_monitor_df
 
 
 
@@ -343,31 +379,6 @@ def preprocess_merged_df(merged_df, correct_gain=True, butterworth_filter=True, 
     return merged_df
 
 
-def load_and_merge_all_controller_columns(merged_filtered_df, monitor_file_path_list, settings_file_path_list):
-    mask = merged_filtered_df.map(lambda x: isinstance(x, (list, np.ndarray, tuple))).any(axis=0) # arrays
-    monitor_df = merged_filtered_df.drop(mask.index[mask], axis=1).copy() # drop arrays
-    controller_df = load_merge_to_controller_df(monitor_file_path_list, settings_file_path_list)
-
-    full_monitor_df = pd.merge_asof(
-        left=monitor_df,
-        right=controller_df,
-        left_on='time_collected',
-        right_on='Time',
-        direction='nearest' )
-
-    # non unique columns aren't informative
-    non_unique_cols = [c for c in full_monitor_df.columns if len(full_monitor_df[c].unique()) == 1] 
-    full_monitor_df.drop(columns=non_unique_cols, inplace=True)
-
-    full_monitor_df.drop(['Time_str', 'Time_str_x', 'Time_str_y'], axis=1, inplace=True) # drop non-numeric time
-
-    # mask = full_monitor_df.map(lambda x: isinstance(x, (str))).any(axis=0)
-    # str_df = full_monitor_df.loc[:, mask]
-    
-    return full_monitor_df
-
-
-
 ### calculations
 ## TODO: find a way to speed up and parallelize
 def calculate_mean_diff(merged_df, overwrite=False, save_to_pickle=False):
@@ -390,15 +401,16 @@ def calculate_mean_diff(merged_df, overwrite=False, save_to_pickle=False):
 
 
 def feature_worker(x, t_):
-        return {
-            "amplitude": pj.maxMinusMin(x),
-            "Hilbert_ToF": pj.envelopeThresholdTOF(x, t_, 0.15),
-            "Hilbert_noise_ToF": pj.firstIndexAboveNoise(x),
-            "max": max(abs(x)),
-            "hilbert": pj.hilbertEnvelope(x),
-        }
+    return {
+        "amplitude": pj.maxMinusMin(x),
+        "Hilbert_ToF": pj.envelopeThresholdTOF(x, t_, 0.15),
+        "Hilbert_noise_ToF": pj.firstIndexAboveNoise(x),
+        "max": max(abs(x)),
+        "hilbert": pj.hilbertEnvelope(x),
+    }
         
-def calculate_waveform_features(merged_df, overwrite=False, save_to_pickle=False):
+
+def calculate_waveform_features(merged_df, overwrite=False, save_to_pickle=False, pooled=False):
     '''Calculate waveform features from the merged dataframe.'''
     
     if merged_df.attrs.get('waveform_features_calculated', False) and not overwrite:
@@ -409,14 +421,17 @@ def calculate_waveform_features(merged_df, overwrite=False, save_to_pickle=False
     t_ = merged_df.attrs['time']
 
     for k in tqdm(keys, total=len(keys), desc='Calculating waveform features'):
-        with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
-            results = list(executor.map(feature_worker, merged_df[k], itertools.repeat(t_)))
+        if not pooled:
+            results = list(map(feature_worker, merged_df[k], itertools.repeat(t_)))
+        else:
+            with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
+                results = list(executor.map(feature_worker, merged_df[k], itertools.repeat(t_)))
             
-            merged_df['amplitude_'+k+' (mV)'] = [r['amplitude'] for r in results]
-            merged_df['Hilbert_ToF_'+k+' (ns)'] = [r['Hilbert_ToF'] for r in results]
-            merged_df['Hilbert_noise_Tof_'+k+' (ns)'] = [r['Hilbert_noise_ToF'] for r in results]
-            merged_df['max_'+k+' (mV)'] = [r['max'] for r in results]
-            merged_df['Hilbert_window_'+k] = [r['hilbert'] for r in results]
+        merged_df['amplitude_'+k+' (mV)'] = [r['amplitude'] for r in results]
+        merged_df['Hilbert_ToF_'+k+' (ns)'] = [r['Hilbert_ToF'] for r in results]
+        merged_df['Hilbert_noise_Tof_'+k+' (ns)'] = [r['Hilbert_noise_ToF'] for r in results]
+        merged_df['max_'+k+' (mV)'] = [r['max'] for r in results]
+        merged_df['Hilbert_window_'+k] = [r['hilbert'] for r in results]
 
     merged_df.attrs['waveform_features_calculated'] = True
 
@@ -440,14 +455,14 @@ def fft_magnitude_worker(x, f_len):
     dict
         A dictionary containing the FFT and magnitude
     '''
-    fft_val = np.fft.fftshift(np.fft.fft(x))
-    magnitude = np.abs(fft_val) / f_len
+    fft_val = np.fft.fftshift(np.fft.fft(x))/ f_len
+    magnitude = np.abs(fft_val) 
     return {
         "fft": fft_val,
         "magnitude": magnitude,
     }
 
-def calculate_fft_magnitude_features(merged_df, overwrite=False, save_to_pickle=False):
+def calculate_fft_magnitude_features(merged_df, overwrite=False, save_to_pickle=False, pooled=False):
     '''Calculate fft and fft magnitude features from the merged dataframe.'''
 
     if merged_df.attrs.get('fft_magnitude_features_calculated', False) and not overwrite:
@@ -458,11 +473,13 @@ def calculate_fft_magnitude_features(merged_df, overwrite=False, save_to_pickle=
     f_len = len(merged_df.attrs['time'])
 
     for k in tqdm(keys, desc='Calculating FFT and magnitude'):
-        with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
-            results = list(executor.map(fft_magnitude_worker, merged_df[k], itertools.repeat(f_len)))
+        if not pooled: results = list(map(fft_magnitude_worker, merged_df[k], itertools.repeat(f_len)))
+        else:
+            with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
+                results = list(executor.map(fft_magnitude_worker, merged_df[k], itertools.repeat(f_len)))
 
-            merged_df['fft_'+k] = [r['fft'] for r in results]
-            merged_df['fft_magnitude_'+k] = [r['magnitude'] for r in results]
+        merged_df['fft_'+k] = [r['fft'] for r in results]
+        merged_df['fft_magnitude_'+k] = [r['magnitude'] for r in results]
 
     merged_df.attrs['fft_magnitude_features_calculated'] = True
 
@@ -486,14 +503,14 @@ def phase_group_delay_worker(x, f_):
     dict
         A dictionary containing the phase and group delay
     '''
-    phase = np.unwrap(np.angle(x))
-    group_delay = -np.gradient(phase, f_) / 2 / np.pi
+    phase = np.unwrap(np.angle(x)) #TODO: why unwrap with period of pi an not 2pi?
+    group_delay = -np.gradient(phase, f_) / 2/np.pi
     return {
         "phase": phase,
         "group_delay": group_delay,
     }
 
-def calculate_phase_group_delay_features(merged_df, overwrite=False, save_to_pickle=False):
+def calculate_phase_group_delay_features(merged_df, overwrite=False, save_to_pickle=False, pooled=False):
     '''Calculate fft phase and group delay features from the merged dataframe.'''
 
     if merged_df.attrs.get('phase_group_delay_features_calculated', False) and not overwrite:
@@ -504,11 +521,14 @@ def calculate_phase_group_delay_features(merged_df, overwrite=False, save_to_pic
     f_ = merged_df.attrs['freq']
 
     for k in tqdm(keys, desc='Calculating phase and group delay'):
-        with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
-            results = list(executor.map(phase_group_delay_worker, merged_df[k], itertools.repeat(f_)))
-
-            merged_df['fft_phase_'+k] = [r['phase'] for r in results]
-            merged_df['fft_group_delay_'+k] = [r['group_delay'] for r in results]
+        if not pooled: 
+            results = list(map(phase_group_delay_worker, merged_df['fft_'+k], itertools.repeat(f_)))
+        else:
+            with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
+                results = list(executor.map(phase_group_delay_worker, merged_df['fft_'+k], itertools.repeat(f_)))
+                
+        merged_df['fft_phase_'+k] = [r['phase'] for r in results]
+        merged_df['fft_group_delay_'+k] = [r['group_delay'] for r in results]
 
     merged_df.attrs['phase_group_delay_features_calculated'] = True
 
@@ -517,29 +537,6 @@ def calculate_phase_group_delay_features(merged_df, overwrite=False, save_to_pic
         merged_df.to_pickle(f"{merged_df.attrs['save_directory']}/{merged_df.attrs['save_name']}")
     
     return merged_df
-
-
-def calculate_frequency_features(merged_df, overwrite=False, save_to_pickle=False):
-    # '''Calculate fft features from the merged dataframe.'''
-    
-    # if merged_df.attrs.get('frequency_features_calculated', False) and not overwrite:
-    #     print("Warning: The merged dataframe has already had frequency features calculated. Skipping calculation.")
-    #     return merged_df
-    
-    # keys = merged_df.columns[np.where(merged_df.columns.str.startswith('voltage_'))]
-    # f_ = np.fft.fftshift( np.fft.fftfreq( len(merged_df.attrs['time']), d=(merged_df.attrs['time'][1] - merged_df.attrs['time'][0])))
-    # merged_df.attrs['freq'] = f_
-
-    # merged_df = calculate_fft_magnitude_features(merged_df)
-    # merged_df = calculate_phase_group_delay_features(merged_df)
-       
-    # if save_to_pickle:
-    #     print('Saving frequency features to pickle...')
-    #     merged_df.to_pickle(f"{merged_df.attrs['save_directory']}/{merged_df.attrs['save_name']}")
-        
-    # return merged_df
-    pass
-
 
 
     
@@ -636,8 +633,6 @@ def calculate_avgs_by_T(merged_filtered_df, temps, crop=None, polyfit_degree=1,
 
 
 
-
-
 ### plotting functions
 # TODO
 def plot_detrended_amplitude(df,):
@@ -716,7 +711,6 @@ def plot_detrended_tof(merged_df):
     plt.show()
 
 
-
 def waveform_interact_decorator(func):
     def wrapper(*args, **kwargs):
         merged_df = kwargs.pop('merged_df', None)
@@ -753,24 +747,46 @@ def plot_waveform(i, merged_df=None, max_=None, keys=None):
     
 @waveform_interact_decorator
 def plot_hilbert(i, merged_df=None, max_=None):
+     keys = merged_df.columns[np.where(merged_df.columns.str.startswith('voltage_'))]
+     
+     fig,ax = plt.subplots(figsize=(8, 4))
+             
+     for key_ in keys:
+         ax.plot(merged_df.attrs['time'], merged_df[key_][i], lw=1, label=key_)
+         ax.plot(merged_df.attrs['time'], merged_df['Hilbert_window_'+key_][i], lw=0.5, linestyle='--', color=ax.lines[-1].get_color())
+     
+     ax.set_title(f'{i}: ({merged_df["Time_str"][i]}), (F, R)=({merged_df["1000.1: CH1 Object"][i]:.2f}, {merged_df["1000.2: CH2 Object"][i]:.2f})ºC ')
+     ax.set_ylim(-max_, max_*1.1)
+     ax.set_xlabel('Time (ns)')
+     ax.set_ylabel('Voltage (mV)')
+     
+     fig.legend(loc='upper center', bbox_to_anchor=(0.5, 0.05), ncol=2)
+     fig.tight_layout()
+ 
+    
+@waveform_interact_decorator
+def plot_re_im_fft(i, merged_df=None, max_=None, freq_crop=None):
     keys = merged_df.columns[np.where(merged_df.columns.str.startswith('voltage_'))]
+    # keys = ['voltage_echo_reverse']
+
+    fig,ax = plt.subplots(4, figsize=(6,10))
+    fig.suptitle(f'{i}: ({merged_df["Time_str"][i]}), (F, R)=({merged_df["1000.1: CH1 Object"][i]:.2f}, {merged_df["1000.2: CH2 Object"][i]:.2f})ºC ')
+    if freq_crop is None: freq_crop = [0, len(merged_df.attrs['freq'])]
+
+    for ind,k in enumerate(keys):
+        fft_dat = merged_df['fft_'+k][i][freq_crop[0]:freq_crop[1]]
+        ax[ind].plot(merged_df.attrs['freq'][freq_crop[0]:freq_crop[1]], fft_dat.real, lw=1)
+        ax[ind].plot(merged_df.attrs['freq'][freq_crop[0]:freq_crop[1]], fft_dat.imag, lw=0.5, linestyle='-.', color=ax[ind].lines[-1].get_color())
     
-    fig,ax = plt.subplots(figsize=(8, 4))
-            
-    for key_ in keys:
-        ax.plot(merged_df.attrs['time'], merged_df[key_][i], lw=1, label=key_)
-        ax.plot(merged_df.attrs['time'], merged_df['Hilbert_window_'+key_][i], lw=0.5, linestyle='--', color=ax.lines[-1].get_color())
-    
-    ax.set_title(f'{i}: ({merged_df["Time_str"][i]}), (F, R)=({merged_df["1000.1: CH1 Object"][i]:.2f}, {merged_df["1000.2: CH2 Object"][i]:.2f})ºC ')
-    ax.set_ylim(-max_, max_*1.1)
-    ax.set_xlabel('Time (ns)')
-    ax.set_ylabel('Voltage (mV)')
+        ax[ind].set_title('fft_'+k)
+        
+    ax[ind].set_xlabel('frequency (1/ns)')
     
     fig.legend(loc='upper center', bbox_to_anchor=(0.5, 0.05), ncol=2)
     fig.tight_layout()
-    
+     
 @waveform_interact_decorator
-def plot_ffts(i, merged_df=None, max_=None, freq_crop=None):
+def plot_waveform_and_fft(i, merged_df=None, max_=None, freq_crop=None, return_figure=False):
     keys = merged_df.columns[np.where(merged_df.columns.str.startswith('voltage_'))]
     
     fig,ax = plt.subplots(2,2,figsize=(12, 8))
@@ -780,11 +796,12 @@ def plot_ffts(i, merged_df=None, max_=None, freq_crop=None):
     
     for k in keys:
         ax[0].plot(merged_df.attrs['time'], merged_df[k][i], label=k, lw=1)
+        ax[0].plot(merged_df.attrs['time'], merged_df['Hilbert_window_'+k][i], lw=0.5, linestyle='--', color=ax[0].lines[-1].get_color())
         ax[1].plot(merged_df.attrs['freq'][freq_crop[0]:freq_crop[1]], merged_df['fft_magnitude_'+k][i][freq_crop[0]:freq_crop[1]], lw=1)
         ax[2].plot(merged_df.attrs['freq'][freq_crop[0]:freq_crop[1]], merged_df['fft_phase_'+k][i][freq_crop[0]:freq_crop[1]], lw=1)
         ax[3].plot(merged_df.attrs['freq'][freq_crop[0]:freq_crop[1]], merged_df['fft_group_delay_'+k][i][freq_crop[0]:freq_crop[1]], lw=1)
         
-    ax[0].set_title('waveform')
+    ax[0].set_title('waveform, Hilbert win')
     ax[0].set_xlabel('time (ns)')
     ax[0].set_ylabel('amplitude')
     ax[0].set_ylim(-max_, max_)
@@ -792,9 +809,7 @@ def plot_ffts(i, merged_df=None, max_=None, freq_crop=None):
     ax[1].set_title('fft')
     ax[1].set_xlabel('frequency (1/ns)')
     ax[1].set_ylabel('magnitude')
-    # ax[1].set_ylim(0, max_)
-    # ax[1].plot(freq[freq_crop[0]:freq_crop[1]], fft_summed_morlet_mag[freq_crop[0]:freq_crop[1]], label='summed morlet', linestyle='--')
-
+    
     ax[2].set_title('phase')
     ax[2].set_xlabel('frequency (1/ns)')
     ax[2].set_ylabel('phase (rad)')
@@ -805,6 +820,8 @@ def plot_ffts(i, merged_df=None, max_=None, freq_crop=None):
 
     fig.legend(loc='upper center', bbox_to_anchor=(0.5, 0.03), ncol=2)
     fig.tight_layout()
+    
+    if return_figure: return fig, ax
      
  
 def experimental_data_interact_decorator(func):
@@ -838,6 +855,7 @@ def experimental_data_interact_decorator(func):
 
 @experimental_data_interact_decorator
 def plot_experimental_data(i=0, keys_=(), df=None, idx_label_type='', x_scaling='collection_time',ylims_=(0, 60),
+                           return_figure=False,
                            ):
     """Plot temperature data with optional secondary variables.
 
@@ -882,8 +900,6 @@ def plot_experimental_data(i=0, keys_=(), df=None, idx_label_type='', x_scaling=
         for idx, key_ in enumerate(keys_):
             ax2.scatter(xticks, df[key_], label=key_, s=10, color=colors[start_idx + idx])
         ax2.set_ylabel('\n'.join([f'{key_}' for key_ in keys_]))
-        # ax2.set_ylim(df[keys_].values.mean() - df[keys_].values.std()*5, 
-        #              df[keys_].values.mean() + df[keys_].values.std()*5)
         
     # formatting
     ax1.set_title('Temperature gradient vs collection time')
@@ -924,16 +940,13 @@ def plot_experimental_data(i=0, keys_=(), df=None, idx_label_type='', x_scaling=
     fig.legend(bbox_to_anchor=(0.5, 0.03), loc='upper center', ncols=min(max(len(keys_)//2+2,1), 3))
     fig.tight_layout()
 
-    # # highlight specific indices based on conditions
-    # if highlight_where:
-    #     for key, value in highlight_where.items():
-    #         highlight_indices = df.index[ value(df[key]) ].tolist()
-    #         if highlight_indices:
-    #             highlight_indices = np.asarray(sorted(highlight_indices), dtype=int)
-    #             blocks = np.split(highlight_indices, np.where(np.diff(highlight_indices) != 1)[0] + 1)
-    #             for block in blocks:
-    #                 ax1.axvspan(xticks[block.min()], xticks[block.max()], color='gray', alpha=0.15)
+    if return_figure: return fig, ax1
 
+
+def plot_wave_fft_experimental_data(i=0, keys_=(), df=None, idx_label_type='', x_scaling='collection_time',ylims_=(0, 60),
+                           return_figure=False,
+                           ): ## 
+    pass
 
 def format_polyfit_params(T_fits_df, k, t_type):
     if T_fits_df.loc[k,"params"].shape[0] == 1:
@@ -1055,15 +1068,32 @@ def plot_overall_waveforms(merged_filtered_df, temps, key, crop=None, t_type='dT
         cbar2.ax.set_title('T', pad=10)    
     
     
-
 ## PCA and stat analysis
     
-def plot_pca_variance(X_scaled, components=15):
-    
+def get_pca_loadings(pca):
+    '''get loadings from PCA object and return as a dataframe with feature names as index and PC numbers as columns.'''
+    return pd.DataFrame(
+                pca.components_.T, # eigenvectors
+                index=pca.feature_names_in_,
+                columns=[f"PC: {i+1}" for i, val in enumerate(pca.explained_variance_)] # enum eigenvalues
+            ) 
+
+def get_top_loadings(loadings_df, top_n=10):
+    '''Get the top n loadings for each principal component.'''
+    top_loadings = {}
+    for pc in loadings_df.columns:
+        top_loadings[pc] = loadings_df[pc].abs().nlargest(top_n).index.tolist()
+        
+    return pd.DataFrame(top_loadings, 
+                        index=[f"Rank {i+1}" for i in range(10)])
+
+
+def plot_pca_scree(X_scaled, components=20):
+    '''Plot the explained variance and cumulative explained variance of PCA components.'''
     pca = PCA(n_components=components)
     transformed = pca.fit_transform(X_scaled)
     
-    fig, ax = plt.subplots()
+    fig, ax = plt.subplots(figsize=4,4)
     x = np.arange(1, components + 1)
     explained = pca.explained_variance_ratio_
     cumulative = np.cumsum(explained)
@@ -1080,6 +1110,89 @@ def plot_pca_variance(X_scaled, components=15):
     ax.set_ylim(0, 1.25)
     ax.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
     fig.legend(loc='lower center', ncol=1, bbox_to_anchor=(0.5, -0.2), frameon=False)   
+        
+def plotly_loadings_heatmap(loadings_df):
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=loadings_df.to_numpy(),
+            x=loadings_df.columns,
+            y=loadings_df.index,
+            colorscale="RdBu_r",
+            zmid=0,
+            hovertemplate=(
+                "Feature: %{y}<br>"
+                "PC: %{x}<br>"
+                "Loading: %{z:.3f}<extra></extra>"
+            ),
+        )
+    );
+
+    fig.update_layout(
+        title="PCA Loadings Heatmap",
+        xaxis_title="Principal component",
+        yaxis_title="Feature",
+        template="plotly_white",
+        height=1200,
+        width=800,
+    );
+
+    fig.update_xaxes(side="top");
+    fig.update_yaxes(autorange="reversed");
+    return fig    
+
+
+def plot_pc_scores_by_rank(top_10_df, transformed, full_monitor_df, pc_x=1, pc_y=2, color_pc=None, rank=1, cmap='viridis', s=12, alpha=0.75):
+    """
+    Scatter plot of PCA-transformed samples.
+
+    Parameters
+    ----------
+    pc_x : int
+        Principal component to use on the x-axis (1-based index).
+    pc_y : int
+        Principal component to use on the y-axis (1-based index).
+    color_pc : int or None
+        PCA column used to select the feature whose values color the points.
+        If None, uses pc_x.
+    rank : int
+        Rank within the selected PC column (1..10) to choose which feature to color by.
+    """
+    if pc_x == pc_y: raise ValueError("pc_x and pc_y must be different.")
+    if not (1 <= pc_x <= transformed.shape[1]) or not (1 <= pc_y <= transformed.shape[1]): raise ValueError(f"pc_x and pc_y must be in [1, {transformed.shape[1]}].")
+    if color_pc is None:  color_pc = pc_x
+    if not (1 <= color_pc <= transformed.shape[1]): raise ValueError(f"color_pc must be in [1, {transformed.shape[1]}].")
+    if not (1 <= rank <= 10): raise ValueError("rank must be between 1 and 10.")
+
+    pc_x_name = f"PC: {pc_x}"
+    pc_y_name = f"PC: {pc_y}"
+    color_col = f"PC: {color_pc}"
     
-    
-    
+
+    feature = top_10_df.loc[f"Rank {rank}", color_col]
+    if feature not in transformed.columns: raise ValueError(f"Feature '{feature}' not found in transformed.columns.")
+
+    x_vals = transformed[:, pc_x - 1]
+    y_vals = transformed[:, pc_y - 1]
+    color_vals = full_monitor_df[feature].to_numpy()
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    sc = ax.scatter(
+        x_vals,
+        y_vals,
+        c=color_vals,
+        cmap=cmap,
+        s=s,
+        alpha=alpha,
+        edgecolors='none'
+    )
+
+    ax.set_xlabel(pc_x_name)
+    ax.set_ylabel(pc_y_name)
+    ax.set_title(f"Colors: '{feature}' ({color_col}, rank {rank})")
+    cbar = fig.colorbar(sc, ax=ax)
+    cbar.set_label(feature)
+
+    plt.tight_layout()
+    return fig, ax
+
+
