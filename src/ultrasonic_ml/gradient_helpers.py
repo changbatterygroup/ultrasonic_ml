@@ -381,6 +381,7 @@ def preprocess_merged_df(merged_df, correct_gain=True, butterworth_filter=True, 
 
 ### calculations
 ## TODO: find a way to speed up and parallelize
+
 def calculate_mean_diff(merged_df, overwrite=False, save_to_pickle=False):
     '''Calculate the mean and difference of temperatures from the merged dataframe.'''
     
@@ -397,6 +398,7 @@ def calculate_mean_diff(merged_df, overwrite=False, save_to_pickle=False):
     if save_to_pickle:
         print('Saving mean and difference of temperatures to pickle...')
         merged_df.to_pickle(f"{merged_df.attrs['save_directory']}/{merged_df.attrs['save_name']}")
+    
     return merged_df
 
 
@@ -1093,7 +1095,7 @@ def plot_pca_scree(X_scaled, components=20):
     pca = PCA(n_components=components)
     transformed = pca.fit_transform(X_scaled)
     
-    fig, ax = plt.subplots(figsize=4,4)
+    fig, ax = plt.subplots(figsize=(4,4))
     x = np.arange(1, components + 1)
     explained = pca.explained_variance_ratio_
     cumulative = np.cumsum(explained)
