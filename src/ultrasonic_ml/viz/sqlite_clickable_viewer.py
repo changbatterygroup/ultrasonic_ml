@@ -211,7 +211,7 @@ class AcousticsViewer:
 
     def _create_slider(self):
         slider_ax = self.fig.add_axes(
-            (0.25, 0.02, 0.55, 0.02)
+            (0.25, 0.01, 0.55, 0.02)
         )
 
         self.slider = Slider(
