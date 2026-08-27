@@ -1,4 +1,20 @@
 gathering code and notebooks for ultrasonic analysis
+# Repo structure:
+
+```
+ultrasonic_ml
+│
+├── Notebooks
+│   ├── Project folder
+|   |   |-- notebooks and affiliated docs
+│   ...
+|
+├── src (add to path)
+│   ├── __init__.py
+│   ├── ultrasonic_ml
+│   |   |── get_datetime()
+│
+```
 
 # Restructured to SQlite to faster analysis and visualization
 
@@ -34,6 +50,7 @@ DATABASE.sqlite3
 │   ├── collection_index INTEGER 
 │   ├── X REAL
 │   ├── Z REAL
+|   PRIMARY KEY collection_index
 │
 |── analysis (*method* to write table)
 |   ├── collection_index INTEGER  (same as acoustics table)
@@ -74,18 +91,18 @@ AcousticsDatabase (base)
 │   ├── __enter__()
 │   ├── __exit__()
 │   ├── get_tables()
-│   └── get_columns()
+│   |── get_columns()
+│   ├── fetch_column()
+│   ├── fetch_value()
 │
 ├── parameters
 │   ├── get_parameters()
 │   ├── initialize_frequency_parameters()
 │   └── get_datetime()
 │
-├── waveform handling
+├── Raw waveform handling
 │   ├── get_waveform_columns()
 │   ├── has_waveform()
-│   ├── fetch_column()
-│   ├── fetch_value()
 │   ├── fetch_waveform()
 │   ├── fetch_waveform_batch()
 │   ├── fetch_time()
