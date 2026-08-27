@@ -25,9 +25,10 @@ ultrasonic_ml
 
 
 ## SQlite Database structure:
-1. indent is table
-2. indents are columns
-* original waveform is referenced with collection idx
+1. 1st level indents for tables
+2. 2nd level indent for columns
+
+* original waveform is referenced with collection_index
 * analysis waveforms are recognized with any combination of PRIMARY KEY (collection_index,waveform,analysis_name,result_name,reference_id)
 
 ```text
