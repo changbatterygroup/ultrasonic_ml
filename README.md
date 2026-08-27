@@ -9,10 +9,14 @@ ultrasonic_ml
 |   |   |-- notebooks and affiliated docs
 │   ...
 |
-├── src (add to path)
+├── src (add to path and import pkgs: from ultrasonic_ml.viz import ...)
 │   ├── __init__.py
 │   ├── ultrasonic_ml
-│   |   |── get_datetime()
+|   │   ├── __init__.py
+|   │   ├── data
+|   │   ├── models
+|   │   ├── viz
+│   |   ...
 │
 ```
 
