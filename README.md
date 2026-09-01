@@ -1,34 +1,54 @@
+# Ultrasonic ML
+
 gathering code and notebooks for ultrasonic analysis
-# Repo structure:
+
+## Repository Structure:
 
 ```
 ultrasonic_ml
+|
+|-- README.md
+|-- .gitignore
 │
 ├── Notebooks
 │   ├── Project folder
+|   │   ├── index.rst (outline what you want to display for sphinx documentation)
 |   |   |-- notebooks and affiliated docs
-│   ...
+│   |   ...
 |
 ├── src (add to path and import pkgs: from ultrasonic_ml.viz import ...)
 │   ├── __init__.py
 │   ├── ultrasonic_ml
 |   │   ├── __init__.py
+|   |   |-- utils.py
+|   |   |   ...
 |   │   ├── data
 |   │   ├── models
 |   │   ├── viz
-│   |   ...
+|
+|-- docs (sphinx documentation- updating instructions on bottom)
+|   |-- build (Don't edit)
+|   │   ├── html
+|   │   │   ├── index.html (open this to look at documentation)
+|   │   │   |   ...
+|   │   |   ...
+|   |-- source
+|   │   ├── conf.py (configuration file for building and loading modules)
+|   │   ├── index.rst (structure of the documentation page)
+|   │   ├── examples (symlink to Notebooks folder)
+|   │   |   ...
 │
 ```
 
-# Restructured to SQlite to faster analysis and visualization
+## Restructured to SQlite to faster analysis and visualization
 
-### maintainance:
+#### maintainance:
 * periodically update readme as the functions change
 * find and write TODO tests
 * test heritability of base classes as more functions added on
 
 
-## SQlite Database structure:
+### SQlite Database structure:
 1. 1st level indents for tables
 2. 2nd level indent for columns
 
@@ -57,13 +77,13 @@ DATABASE.sqlite3
 │   ├── Z REAL
 |   PRIMARY KEY collection_index
 │
-|── analysis (*method* to write table)
+|── analysis (*method* to write table) Here, include things that are specific to the result name, such as the names of axes, or the TODO: kwargs used  
 |   ├── collection_index INTEGER  (same as acoustics table)
 |   ├── waveform TEXT (select from column name in acoustics. i.e. voltage, voltage_echo_forward, etc )
 |   ├── analysis_name TEXT (*method* for each. i.e. filter, ungain, hilbert, fft, cwt, correlation )
 |   |-- result_name TEXT (ie raw, magnitude, phase, group_velocity) (*method)
 |   ├── value BLOB (array)
-|   ├── x_axis TEXT (ie time, freq) TODO: are these better in the reference section? need to test flow later
+|   ├── x_axis TEXT (ie time, freq) 
 |   |── x_unit TEXT (ie ns, Hz)
 |   ├── y_axis TEXT (ie time, freq)
 |   |── y_unit TEXT (ie mV, Hz)
@@ -83,7 +103,7 @@ DATABASE.sqlite3
 ...
 ```
 
-## SQlite_Database python class and methods
+### SQlite_Database python class and methods
 ```
 DATABASE
     |
@@ -126,7 +146,7 @@ AcousticsDatabase (base)
 ├── analysis results
 │   ├── create_analysis_table()
 │   ├── store_analysis_result()
-│   ├── fetch_analysis_result()
+│   ├── fetch_analysis_value()
 │   └── list_analysis_results()
 │
 ├── analysis references
@@ -150,7 +170,7 @@ AcousticsDatabase (base)
 ```
 
 
-## Viewer
+### Viewer
 * run in jupyter notebook with
     * `%matplotlib tk` for external window
     * `%matplotlib widget` for inline viewer
@@ -213,3 +233,7 @@ AcousticsViewer (base)
           ├── SpatialViewer
           ├── ThermalGradientsViewer
 ```
+
+## Sphinx documentation
+- When getting started, run `sphinx-build -M html docs/source/ docs/build/`. This shouldn't overwrite existing documentation formatting files.
+- To autogenerate documentation html, from inside docs folder run `sphinx-autobuild source build/html`

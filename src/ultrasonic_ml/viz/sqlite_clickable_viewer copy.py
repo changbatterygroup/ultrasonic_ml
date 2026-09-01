@@ -55,7 +55,7 @@ class AcousticsViewer:
 
     def fetch_analysis(self, analysis, row=None):
         row = self.row if row is None else row
-        return np.asarray([self.db.fetch_analysis_result(row, waveform, analysis, result_name: str, reference_id: int | None = None))
+        return np.asarray([self.db.fetch_analysis_value(row, waveform, analysis, result_name: str, reference_id: int | None = None))
 
     def fetch_time(self, row=None):
         row = self.row if row is None else row

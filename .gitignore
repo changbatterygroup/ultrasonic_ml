@@ -1,5 +1,24 @@
-*/*.pyc
-*__pycache__*
-*.DS_Store
+# ignore cached files
+*.pyc
+__pycache__/
+*/__pycache__/
+*__pycache__/*
+*/*/*/__pycache__/*.pyc
+.DS_Store
+*/.DS_Store
+*/*/.DS_Store
+
+# ignore data files
 *.sqlite3
 *.pickle
+
+# ignore sphinx build files
+docs/build/
+docs/source/api
+docs/source/_static
+docs/source/_templates
+
+*.env
+*/.env
+Notebooks/.env
+Notebooks/.DS_Store
