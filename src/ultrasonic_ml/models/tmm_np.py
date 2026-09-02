@@ -1,7 +1,24 @@
 import numpy as np
 
 def layer_matrix(rho, c, d, f):
-    """2x2 acoustic transfer matrix for one layer at frequency f (Hz)."""
+    """Calculate the 2x2 acoustic transfer matrix for one layer.
+
+    Parameters
+    ----------
+    rho : float
+        Density in kg/m^3.
+    c : float
+        Speed of sound in m/s.
+    d : float
+        Layer thickness in m.
+    f : float
+        Frequency in Hz.
+
+    Returns
+    -------
+    numpy.ndarray
+        2x2 complex acoustic transfer matrix.
+    """
     Z = rho * c
     k = 2 * np.pi * f / c
     kd = k * d
