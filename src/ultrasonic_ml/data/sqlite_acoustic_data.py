@@ -11,7 +11,7 @@ import numpy as np
 from scipy.signal import butter, sosfiltfilt
 
 
-class AcousticsDatabase: #TODO: add methods for deleting columns, tables, and reindexing
+class AcousticsDatabase: 
     """Base class for SQLite acoustics data and analysis."""
 
     def __init__(self, database_path: str | Path) -> None:
@@ -46,6 +46,9 @@ class AcousticsDatabase: #TODO: add methods for deleting columns, tables, and re
         self.initialize_frequency_parameters()
         self.create_analysis_table()
         self.create_reference_table()
+        # TODO: add methods for deleting columns, tables, and reindexing.
+        # TODO: Add method for checking before preprocessing a 2nd time
+        # TODO: Do all preprocessing
 
     # -------------------------------------------------------------------------
     # Database
@@ -366,7 +369,7 @@ class AcousticsDatabase: #TODO: add methods for deleting columns, tables, and re
         return int(self.fetch_value(self.index_column, row))
 
     # -------------------------------------------------------------------------
-    # Preprocessing
+    # Preprocessing functions
     # -------------------------------------------------------------------------
 
     def preprocess(self, waveform: str, apply_ungain: bool = False, apply_filter: bool = False, gain_column: str | None = None, offset_column: str | None = None, lower_fs_coeff: float = 1/250, upper_fs_coeff: float = 1/5, filter_order: int = 3, calculate_absolute_max: bool = True) -> int:
@@ -556,6 +559,23 @@ class AcousticsDatabase: #TODO: add methods for deleting columns, tables, and re
             The absolute maximum of the waveform.
         """
         return float(np.max(np.abs(waveform)))
+
+    @staticmethod
+    def _hilbert_window(waveform: np.ndarray) -> float:
+        """Calculate the Hilbert window of a waveform.
+
+        Parameters
+        ----------
+        waveform : np.ndarray
+            The waveform data.
+
+        Returns
+        -------
+        np.float64
+            The Hilbert window of the waveform.
+        """
+        hilbert_transform = np.hilbert(waveform)
+        return float(np.max(np.abs(hilbert_transform)))
 
     # -------------------------------------------------------------------------
     # Analysis
@@ -922,3 +942,63 @@ class AcousticsDatabase: #TODO: add methods for deleting columns, tables, and re
         """
             
         return '"' + identifier.replace('"', '""') + '"'
+    
+    
+    
+# TODO: build out and integrate with visualization classes    
+class AcousticsDatabaseFrequencyDomain(AcousticsDatabase):
+    """A class for handling frequency domain data in an acoustics database.
+
+    This class extends the AcousticsDatabase class to provide additional functionality
+    for working with frequency domain data, such as FFT results.
+    """
+
+    def __init__(self, database_path: str):
+        """Initialize the AcousticsDatabaseFrequencyDomain instance.
+
+        Parameters
+        ----------
+        database_path : str
+            The path to the SQLite database file.
+        """
+        super().__init__(database_path)
+        
+        
+        
+        
+class AcousticsDatabaseCWT(AcousticsDatabaseFrequencyDomain):
+    """A class for handling continuous wavelet transform data in an acoustics database.
+
+    This class extends the AcousticsDatabaseFrequencyDomain class to provide additional functionality
+    for working with continuous wavelet transform data.
+    """
+
+    def __init__(self, database_path: str):
+        """Initialize the AcousticsDatabaseCWT instance.
+
+        Parameters
+        ----------
+        database_path : str
+            The path to the SQLite database file.
+        """
+        super().__init__(database_path)
+        
+        
+
+class AcousticsDatabaseTMM(AcousticsDatabaseFrequencyDomain):
+    """A class for handling time-frequency map data in an acoustics database.
+
+    This class extends the AcousticsDatabase class to provide additional functionality
+    for working with time-frequency map data.
+    """
+
+    def __init__(self, database_path: str):
+        """Initialize the AcousticsDatabaseTMM instance.
+
+        Parameters
+        ----------
+        database_path : str
+            The path to the SQLite database file.
+        """
+        super().__init__(database_path)
+        
