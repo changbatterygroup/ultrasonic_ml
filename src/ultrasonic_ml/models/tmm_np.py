@@ -4,7 +4,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 from czt import czt, iczt
 from scipy import signal
-
+from ..utils import profile
+import time
 
 import re
 
@@ -442,6 +443,7 @@ def get_unique(arr, tolerance):
     mask = np.concatenate(([True], diffs > tolerance))
     return arr[mask]
 
+@profile
 def generate_acoustic_paths(num_layers=2, max_order=1):
     """
     Generates all valid reflection and transmission paths up to a specified order. With gemini
@@ -756,7 +758,7 @@ def plot_layers(layers_df, ax=None, show_layers='all', aspect_scale=12):
     
     return fig, ax
 
-def plot_waveforms(t, waveforms, envelopes, labels=None, ax=None):
+def plot_waveforms(t, waveforms, envelopes, labels=None, ax=None, x_label="Time (μs)", y_label="Amplitude (mV)"):
 
     if ax is None: _, ax = plt.subplots(figsize=(max_figwidth, 3), dpi=100)
 
@@ -766,8 +768,8 @@ def plot_waveforms(t, waveforms, envelopes, labels=None, ax=None):
         except: ax.plot(t*1e6, waveforms[i])
         ax.plot(t*1e6, envelopes[i], linestyle="--", color=ax.get_lines()[-1].get_color())
     
-    ax.set_xlabel("Time (μs)")
-    ax.set_ylabel("Amplitude (mV)")
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label)
     ax.legend()
 
     return ax
