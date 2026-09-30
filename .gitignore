@@ -22,3 +22,6 @@ docs/source/_templates
 */.env
 Notebooks/.env
 Notebooks/.DS_Store
+
+*.gif
+*/*.gif
