@@ -1,11 +1,13 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.animation import PillowWriter
 import numpy as np
 from czt import czt, iczt
 from scipy import signal
 from ..utils import profile
 import time
+from tqdm import tqdm
 
 import re
 
@@ -18,7 +20,6 @@ def compute_acoustic_properties(param_df, f0=2.25e6):
     param_df["Z"] = (rho * c).tolist()
     param_df['wavelength'] = [c / f0 for c in param_df['sound_speed']]
     return param_df
-
 
 def format_chem_formula(formula, mode="mpl"):
     """
@@ -59,8 +60,7 @@ Si_param_dict = {
     "density": np.array([2.3, 1.93, 1.55, 1.28, 1.22, 1.18]) * 1e3,
     "E": np.array([151.1, 92.68, 84.59, 82.92, 48.59, 75.69]) * 1e9,
     "thickness": [0.005, 0.005, 0.005, 0.005, 0.005, 0.005],
-    "attenuation": np.zeros(6),
-}
+    "attenuation": np.zeros(6), }
 Si_param_dict["name_mpl"] = [format_chem_formula(n, "mpl") for n in Si_param_dict["name"]]
 
 NMC622_param_dict = {
@@ -109,6 +109,7 @@ param_dicts = [Si_param_dict, NMC622_param_dict, LSPCl_param_dict, metals_param_
 params = pd.concat([pd.DataFrame(dict_) for dict_ in param_dicts], ignore_index=True)
 params = compute_acoustic_properties(params)
 
+
 def construct_stack_df(stack):
     '''
     Construct a DataFrame from a list of materials and their properties.
@@ -125,6 +126,10 @@ def construct_stack_df(stack):
 
     stack_df = pd.DataFrame(stack_rows)
     stack_df = stack_df.reset_index(drop=True)
+    name_mask = stack_df.columns.str.startswith("name_")
+    ordered_columns = stack_df.columns[~name_mask].append(stack_df.columns[name_mask])
+    stack_df = stack_df.loc[:, ordered_columns]
+    
     return stack_df
 
 def style_stack_df(stack_df):
@@ -331,7 +336,101 @@ def reflection_response(frequencies, layers):
     return np.array(reflections)
 
 
-def apply_response(waveform, dt, response, transform_method="fft"):
+def pad_t_signal(t, signal, dt, beginning_pad_zeros=0, end_pad_zeros=0):
+    """
+    Pad a signal with zeros at the beginning and end.
+
+    Parameters
+    ----------
+    signal : array_like
+        Input signal.
+    beginning_pad_zeros : int, optional
+        Number of zeros to pad at the beginning. Default is 0.
+    end_pad_zeros : int, optional
+        Number of zeros to pad at the end. Default is 0.
+
+    Returns
+    -------
+    numpy.ndarray
+        Zero-padded signal.
+    """
+    new_signal = np.pad(signal, (beginning_pad_zeros, end_pad_zeros), mode='constant', constant_values=0)
+    new_t = np.pad(t, (beginning_pad_zeros, end_pad_zeros), mode='linear_ramp', end_values=(t[0]-beginning_pad_zeros*dt, t[-1]+end_pad_zeros*dt))
+    return new_t, new_signal
+
+
+def unpad_t_signal(t, signal, beginning_pad_zeros=0, end_pad_zeros=0):
+    """
+    Remove zero-padding from a signal.
+
+    Parameters
+    ----------
+    signal : array_like
+        Input signal.
+    beginning_pad_zeros : int, optional
+        Number of zeros padded at the beginning. Default is 0.
+    end_pad_zeros : int, optional
+        Number of zeros padded at the end. Default is 0.
+
+    Returns
+    -------
+    numpy.ndarray
+        Unpadded signal.
+    """
+    new_signal = signal[beginning_pad_zeros:len(signal)-end_pad_zeros]
+    new_t = t[beginning_pad_zeros:len(t)-end_pad_zeros]
+    return new_t, new_signal
+
+def fft_phase_shifted(t, signal, dt, 
+                      beginning_pad_zeros=0, end_pad_zeros=0):
+    '''Apply phase correction to a signal in the frequency domain.'''
+    t0 = t[0] # this is how much time has passed before the first sample, so we need to correct for it in the frequency domain
+    
+    t, signal = pad_t_signal(t, signal, dt, beginning_pad_zeros, end_pad_zeros)
+    freqs = np.fft.fftfreq(len(t), d=dt)
+    phase_correction = np.exp(-1j * 2 * np.pi * freqs * t0)
+    
+    fft_raw = np.fft.fft(signal, norm="ortho")
+    fft_shifted = fft_raw * phase_correction
+
+    return freqs, fft_shifted
+
+
+# def apply_response(waveform, dt, response, transform_method="fft"):
+#     """
+#     Apply a frequency response to a real-valued waveform.
+
+#     Parameters
+#     ----------
+#     waveform : array_like
+#         Real-valued input waveform.
+#     dt : float
+#         Sampling interval in seconds.
+#     response : array_like
+#         Complex frequency response corresponding to the positive
+#         frequencies of the waveform.
+#     transform_method : str, optional
+#         Method to use for the transform. Options are "fft" or "czt".
+
+#     Returns
+#     -------
+#     numpy.ndarray
+#         Real-valued output waveform.
+#     """
+#     if transform_method == "fft":
+#         spectrum = np.fft.rfft(waveform)
+#         return np.fft.irfft(spectrum * response, n=len(waveform))
+#     elif transform_method == "czt":
+#         # 1. Create a sample time-domain signal (e.g., a sine wave)
+#         N, M = len(waveform), len(waveform)
+#         czt_transform = czt(m=M, n=N)
+#         iczt_transform = iczt(m=M, n=N)
+#         spectrum = czt_transform(waveform)
+#         return iczt_transform(spectrum * response)
+#     else:
+#         raise ValueError("Unsupported transform method")
+
+def apply_response(waveform, response, transform_method="fft"):
     """
     Apply a frequency response to a real-valued waveform.
 
@@ -342,8 +441,9 @@ def apply_response(waveform, dt, response, transform_method="fft"):
     dt : float
         Sampling interval in seconds.
     response : array_like
-        Complex frequency response corresponding to the positive
-        frequencies of the waveform.
+        Complex frequency response, evaluated at the *signed* frequencies
+        from np.fft.fftfreq(len(waveform), dt) -- i.e. full spectrum,
+        not just non-negative frequencies.
     transform_method : str, optional
         Method to use for the transform. Options are "fft" or "czt".
 
@@ -353,18 +453,24 @@ def apply_response(waveform, dt, response, transform_method="fft"):
         Real-valued output waveform.
     """
     if transform_method == "fft":
-        spectrum = np.fft.rfft(waveform)
-        return np.fft.irfft(spectrum * response, n=len(waveform))
+        spectrum = np.fft.fft(waveform)
+        out = np.fft.ifft(spectrum * response)
+        # # imaginary part should be ~numerical noise if response satisfies H(-f) = H(f)*; report it instead of hiding it
+        # max_imag = np.max(np.abs(out.imag))
+        # if max_imag > 1e-6 * np.max(np.abs(out.real)):
+        #     warnings.warn(f"apply_response: non-negligible imaginary part "
+        #                    f"({max_imag:.3e}), check H(-f)=H(f)* symmetry")
+        return out
+    
     elif transform_method == "czt":
-        # 1. Create a sample time-domain signal (e.g., a sine wave)
         N, M = len(waveform), len(waveform)
         czt_transform = czt(m=M, n=N)
         iczt_transform = iczt(m=M, n=N)
         spectrum = czt_transform(waveform)
-        return iczt_transform(spectrum * response)
+        return iczt_transform(spectrum * response).real
     else:
         raise ValueError("Unsupported transform method")
-
+    
 def propagate_waveform(waveform, dt, layers, transform_method='fft'):
     """
     Propagate a waveform through the layered stack.
@@ -384,11 +490,11 @@ def propagate_waveform(waveform, dt, layers, transform_method='fft'):
         Transmitted waveform.
     """
     if transform_method == 'fft':
-        f = np.fft.rfftfreq(len(waveform), dt)
+        f = np.fft.fftfreq(len(waveform), dt)
     else:
         raise ValueError("Unsupported transform method")
     H = transmission_response(f, layers)
-    return apply_response(waveform, dt, H, transform_method=transform_method)
+    return apply_response(waveform, H, transform_method=transform_method)
 
 def reflect_waveform(waveform, dt, layers):
     """
@@ -408,9 +514,10 @@ def reflect_waveform(waveform, dt, layers):
     numpy.ndarray
         Reflected waveform.
     """
-    f = np.fft.rfftfreq(len(waveform), dt)
+    f = np.fft.fftfreq(len(waveform), dt)
     H = reflection_response(f, layers)
-    return apply_response(waveform, dt, H)
+    return apply_response(waveform, H)
+
 
 def total_waveform(waveform, dt, layers):
     """
@@ -675,17 +782,23 @@ def compare_tmm_waveform_coefficients(input_waveform, transmitted_waveform, refl
         })
     
     
-### visualization ###
+    
+#########################################################
+##################### visualization #####################
+#########################################################
+
 import matplotlib
+import matplotlib.pyplot as plt
 from matplotlib.widgets import Slider
+from matplotlib.animation import FuncAnimation, PillowWriter
 
 plt.rcParams.update({
         'font.family': 'Arial',
         'font.size': 16,
-        'figure.dpi': 300,
-        'savefig.dpi': 300, })
+        'figure.dpi': 100,
+        'savefig.dpi': 100, })
 
-def get_max_figwidth(margin=0.85, fallback=14):
+def get_max_fig_dims(margin=0.9, fallback=14):
     """
     Determine a sensible max figure width (in inches) based on the 
     current screen's resolution, so tk windows never exceed screen bounds.
@@ -702,17 +815,20 @@ def get_max_figwidth(margin=0.85, fallback=14):
         root = tk.Tk()
         root.withdraw()  # don't actually show a blank window
         screen_width_px = root.winfo_screenwidth()
-        dpi = root.winfo_fpixels('1i')
+        screen_height_px = root.winfo_screenheight()
+        dpi = plt.rcParams.get('figure.dpi')  # default to 100 if not set
         root.destroy()
-        return (screen_width_px / dpi) * margin
+        return (screen_width_px / dpi) * margin, (screen_height_px / dpi) * margin
     except Exception:
         return fallback
 
-max_figwidth = get_max_figwidth()
-print('tk max_figwidth:', max_figwidth)
+max_figwidth, max_figheight = get_max_fig_dims()
+
+print(f'tk max_dimensions: {max_figwidth:.2f} x {max_figheight:.2f}')
 
 
-def plot_layers(layers_df, ax=None, show_layers='all', aspect_scale=12):
+
+def plot_layers(layers_df, ax=None, show_layers='all', aspect_scale=12, title='Layers_stack'):
     """
     Plot a horizontal bar chart of the layered stack.
 
@@ -754,11 +870,13 @@ def plot_layers(layers_df, ax=None, show_layers='all', aspect_scale=12):
         x += l["thickness"]
 
     ax.set(xlim=(0, x), ylim=(0, 1), yticks=[],
-        xlabel="Depth (m)", title="Layered Acoustic Stack")
+        xlabel="Depth (m)")
+    ax.set_title(title)
     
     return fig, ax
 
-def plot_waveforms(t, waveforms, envelopes, labels=None, ax=None, x_label="Time (μs)", y_label="Amplitude (mV)"):
+def plot_waveforms(t, waveforms, envelopes=None, labels=None, ax=None, 
+                   title="Waveforms", x_label="Time (μs)", y_label="Amplitude (mV)"):
 
     if ax is None: _, ax = plt.subplots(figsize=(max_figwidth, 3), dpi=100)
 
@@ -766,11 +884,13 @@ def plot_waveforms(t, waveforms, envelopes, labels=None, ax=None, x_label="Time 
     for i in range(len(waveforms)):
         try: ax.plot(t*1e6, waveforms[i], label=labels[i])
         except: ax.plot(t*1e6, waveforms[i])
-        ax.plot(t*1e6, envelopes[i], linestyle="--", color=ax.get_lines()[-1].get_color())
+        if envelopes is not None:
+            ax.plot(t*1e6, envelopes[i], linestyle="--", color=ax.get_lines()[-1].get_color())
     
     ax.set_xlabel(x_label)
     ax.set_ylabel(y_label)
-    ax.legend()
+    ax.set_title(title)
+    if labels: ax.legend()
 
     return ax
 
@@ -844,6 +964,7 @@ def plot_acoustic_path(layers_df, acoustic_path, ax,
     if type_ == 'Transmission': arrow_color="orange"
     if type_ == 'Reflection': arrow_color="green"
     
+    ylim = ax.get_ylim()
     edges = np.concatenate(([0], np.cumsum(layers_df["thickness"].values)))
     left  = {i: edges[i]   for i in range(len(layers_df))}
     right = {i: edges[i+1] for i in range(len(layers_df))}
@@ -871,8 +992,7 @@ def plot_acoustic_path(layers_df, acoustic_path, ax,
         else:
             raise ValueError(f"Unrecognized path element: {step!r}")
 
-    ylim = ax.get_ylim()
-    ax.set_ylim(ylim[0], max(ylim[1], y + y_step))
+    ax.set_ylim(ylim[0], ylim[1])
     if title is not None: ax.set_title(title)
 
     return ax
@@ -892,7 +1012,6 @@ def clear_acoustic_path(ax):
     return ax
 
 
-
 def plot_tmm_peaks(t, envelope, peak_inds, ax, crop_peaks=20, show_legend=False, label='TMM Peaks'):
     """
     Plot the peaks in the TMM waveform.
@@ -904,8 +1023,8 @@ def plot_tmm_peaks(t, envelope, peak_inds, ax, crop_peaks=20, show_legend=False,
 
 
 def plot_theoretical_path_times(theoretical_transmission_delays, theoretical_reflection_delays, ax, show_legend=True):
-    ax.vlines([t*1e6 for t in theoretical_transmission_delays], -5,5, linewidth=1, color='orange', linestyle=':', label='Theoretical Transmission')
-    ax.vlines([t*1e6 for t in theoretical_reflection_delays], -5,5, linewidth=1, color='green', linestyle=':', label='Theoretical Reflection')
+    ax.vlines([t*1e6 for t in theoretical_transmission_delays], -5,5, linewidth=1, color='orange', linestyle=':', label='Theor. Trans. times')
+    ax.vlines([t*1e6 for t in theoretical_reflection_delays], -5,5, linewidth=1, color='green', linestyle=':', label='Theor. Refl. times')
     if show_legend: ax.legend()
     
     return ax
@@ -915,12 +1034,14 @@ def plot_theoretical_path_times(theoretical_transmission_delays, theoretical_ref
 def plot_path_waveforms_theoretical_v_tmm_time_delays(layers_df, acoustic_paths, t,
                                           input_waveform, transmitted_waveform, reflected_waveform, 
                                           input_envelope, transmitted_envelope, reflected_envelope,
-                                          layers='all'
+                                          layers='all', return_fig=False
                                           ):
     """
     Plot (0): reflected path through stack, (1): waveform with diaplayed peaks, (2): slider
     """
-    fig, ax = plt.subplots(3, 1, figsize=(max_figwidth, 0.5*max_figwidth), dpi=100)
+    fig, ax = plt.subplots(3, 1, figsize=(max_figwidth, max_figheight), 
+                           gridspec_kw={"height_ratios": [6, 10, 1]},
+                           constrained_layout=True,)
     ax = ax.flatten()
 
     fig, ax[0] = plot_layers(layers_df, ax=ax[0], show_layers=layers)
@@ -951,9 +1072,9 @@ def plot_path_waveforms_theoretical_v_tmm_time_delays(layers_df, acoustic_paths,
         -1.5, 2, linewidth=1.5, color='red', linestyle='-',
         label='Current path')
     ax[1].set_title(f"Waveforms")
-    fig.tight_layout()
     
-    ax[1].legend(loc='upper center', bbox_to_anchor=(0.5, -0.25), ncol=3)    
+    legend_y_pad = plt.rcParams.get('font.size')/plt.rcParams.get('figure.dpi')
+    ax[1].legend(loc='upper center', bbox_to_anchor=(0.5, -legend_y_pad), ncol=3)    
     
     def update(val): # avoid replotting when possible
         path_idx = int(slider.val)
@@ -965,9 +1086,35 @@ def plot_path_waveforms_theoretical_v_tmm_time_delays(layers_df, acoustic_paths,
         fig.canvas.draw_idle()
     
     # slider at bottom to select which path to display
-    ax[2].set_position([0.25, 0.1, 0.5, 0.03])
-    slider = Slider(ax[2], '', 0, len(acoustic_paths)-1, 
-                       valinit=0, valstep=1, valfmt='%d')
+    slider = Slider(ax[2], '', 0, len(acoustic_paths)-1, valinit=0, valstep=1, valfmt='%03d')
     ax[2].set_title("Select Acoustic Path")
     slider.on_changed(update)
+    if return_fig: return fig, ax, slider
+
+
+def save_plot_path_waveforms_gif(layers_df, acoustic_paths, t,
+                                 input_waveform, transmitted_waveform, reflected_waveform,
+                                 input_envelope, transmitted_envelope, reflected_envelope,
+                                 filepath, layers='all', fps=2, dpi=None):
+    """Save a GIF containing one frame for every acoustic-path slider value."""
+    fig, _, slider = plot_path_waveforms_theoretical_v_tmm_time_delays(
+        layers_df, acoustic_paths, t,
+        input_waveform, transmitted_waveform, reflected_waveform,
+        input_envelope, transmitted_envelope, reflected_envelope,
+        layers=layers, return_fig=True,
+    )
+
+    writer = PillowWriter(fps=fps)
+    try:
+        with writer.saving(fig, filepath, dpi or fig.dpi):
+            for path_idx in tqdm(range(len(acoustic_paths)), desc="Saving GIF frames"):
+                slider.set_val(path_idx)
+                fig.canvas.draw()
+                writer.grab_frame()
+    finally:
+        plt.close(fig)
+
+    return filepath
+
+
     

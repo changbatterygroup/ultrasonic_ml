@@ -1,8 +1,10 @@
 import numpy as np
 import time
+from functools import wraps
 
 # Profiling decorator
 def profile(func):
+    @wraps(func)
     def wrapper(*args, **kwargs):
         start_time = time.time()
         result = func(*args, **kwargs)
