@@ -1,23 +1,23 @@
-from __future__ import annotations
+import os 
+os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE" # Disable HDF5 file locking, TODO: check if this is risky
+
 import io
 import json
-import ast
 import sqlite3
-from datetime import datetime
-from functools import lru_cache, wraps
 from pathlib import Path
 from typing import Any, Iterator    
+import h5py
+import pprint
+
 import math
 import numpy as np  
 from scipy.signal import butter, sosfiltfilt, hilbert, find_peaks
+
 from tqdm import tqdm
 
 from ..utils import profile, NumpyEncoder 
-import time
 
-import h5py
 import matplotlib.pyplot as plt
-import pprint
 
 class AcousticSQlite: 
     """Base class for SQLite acoustics data and analysis."""
@@ -524,7 +524,7 @@ class AcousticDatabase:
     
     def print_sqlite_schema(self): self.sqlite_database.print_schema()
     
-    def sqlite_to_h5(self): pass # specific to the child class
+    def sqlite_to_h5(self): raise NotImplementedError # specific to the child class
 
     # -------------------------------------------------------------------------
     # Parameters
@@ -648,7 +648,7 @@ class AcousticDatabase:
             except: pass
             h5.require_dataset('config_metadata', (), data=json_str, dtype=dt)
 
-    def load_parameters(self):
+    def load_parameters(self): 
         print('Loading h5 parameters...')
         with self.open_h5() as h5:
             loaded_json = h5['config_metadata'][()]
@@ -658,7 +658,7 @@ class AcousticDatabase:
             self.len = self.parameters['len']
         print('\tFinished.')
 
-    def setup_parameters(self): pass # specific to the child class. must also set time_array, shape, and len
+    def setup_parameters(self): raise NotImplementedError # specific to the child class. must also set time_array, shape, and len
     
     # -------------------------------------------------------------------------
     # Raw data
@@ -703,14 +703,12 @@ class AcousticDatabase:
     # Indexing
     # -------------------------------------------------------------------------
     
-    def write_indexed_parameter(self, keys, values, shapes): pass # specific to the child class
+    def write_indexed_parameter(self, keys, values, shapes): raise NotImplementedError # specific to the child class
        
-    def load_shape(self): pass # specific to the child class
-    
-    def idx_sqlite_data_generator(self): pass # specific to the child class
+    def idx_sqlite_data_generator(self): raise NotImplementedError # specific to the child class
     
     # fill _ with some combination of whatever axis are in the dataset (w_x_z, x_z, w_y, etc.)
-    def _generator(self): pass # specific to the child class
+    def _generator(self): raise NotImplementedError # specific to the child class
 
     # -------------------------------------------------------------------------
     # Preprocessing
@@ -798,7 +796,7 @@ class AcousticDatabase:
                 hilbert_dset[*idx] = self._hilbert_window(data)
 
     # -------------------------------------------------------------------------
-    # alignment
+    # Alignment
     # -------------------------------------------------------------------------
     
     @staticmethod
@@ -872,7 +870,7 @@ class AcousticDatabase:
     # Basic viz
     # -------------------------------------------------------------------------  
                   
-    def view_mean_raw(self, idx):
+    def view_waveform(self, idx):
         fig, ax = plt.subplots()
         with self.open_h5() as h5:
             data = h5['raw_data']['waveforms']
@@ -957,8 +955,6 @@ class AcousticDatabaseFFT(AcousticDatabase):
                 hilbert_dset[*idx] = hilbert_dset_unrolled[*idx,rollbacks[idx[0]]:new_shape[-1]+rollbacks[idx[0]]]
 
     
-
-
 # Naming convention: Acoustic__Database is a subclass of AcousticDatabase that handles __ data.
 class AcousticScanDatabase(AcousticDatabase):
     """Acoustics database subclass for 2D scan experiments (collection_index <-> X,Z coordinates).
@@ -1012,11 +1008,6 @@ class AcousticScanDatabase(AcousticDatabase):
             for x in range(self.shape[1]):
                 for z in range(self.shape[2]):
                     yield (w,x,z)
-
-    def x_z_generator(self):
-        for x in range(self.shape[1]):
-            for z in range(self.shape[2]):
-                yield (x,z)
 
     # -------------------------------------------------------------------------
     # preprocessing
@@ -1073,88 +1064,88 @@ class AcousticScanDatabase(AcousticDatabase):
 
 
       
-# TODO
-class AcousticsSweepDatabase(AcousticDatabase):
-    """Acoustics database subclass for sweep experiments (collection_index <-> single swept parameter)."""
+# # TODO
+# class AcousticsSweepDatabase(AcousticDatabase):
+#     """Acoustics database subclass for sweep experiments (collection_index <-> single swept parameter)."""
 
-    # -------------------------------------------------------------------------
-    # collection indexing
-    # -------------------------------------------------------------------------
+#     # -------------------------------------------------------------------------
+#     # collection indexing
+#     # -------------------------------------------------------------------------
 
-    def create_collection_index_mapping(self) -> None:
-        """Map collection_index to the swept parameter's values.
-        """
-        if self.parameters.get("experiment") != "sweep":
-            raise ValueError("Parameters do not describe a sweep experiment")
+#     def create_collection_index_mapping(self) -> None:
+#         """Map collection_index to the swept parameter's values.
+#         """
+#         if self.parameters.get("experiment") != "sweep":
+#             raise ValueError("Parameters do not describe a sweep experiment")
 
-        sweep_params = ast.literal_eval(self.parameters["sweepParams"])
-        idx = 0
-        for key, vals in sweep_params.items():
-            mapping = {}
-            self._add_column(key, self.acoustics_table, type=self.types_dict.get(type(vals[0]).__name__, "REAL"))
-            for val in vals:
-                mapping[idx] = val
-                idx += 1
-            self.store_acoustics_value(collection_index=list(mapping.keys()), column=key, value=list(mapping.values()))
+#         sweep_params = ast.literal_eval(self.parameters["sweepParams"])
+#         idx = 0
+#         for key, vals in sweep_params.items():
+#             mapping = {}
+#             self._add_column(key, self.acoustics_table, type=self.types_dict.get(type(vals[0]).__name__, "REAL"))
+#             for val in vals:
+#                 mapping[idx] = val
+#                 idx += 1
+#             self.store_acoustics_value(collection_index=list(mapping.keys()), column=key, value=list(mapping.values()))
 
-    def get_sweep_column(self) -> str:
-        """Get the name of the swept parameter column.
+#     def get_sweep_column(self) -> str:
+#         """Get the name of the swept parameter column.
 
-        Returns
-        -------
-        str
-            The name of the swept parameter.
-        """
-        sweep_params = ast.literal_eval(self.parameters["sweepParams"])
-        return next(iter(sweep_params))
+#         Returns
+#         -------
+#         str
+#             The name of the swept parameter.
+#         """
+#         sweep_params = ast.literal_eval(self.parameters["sweepParams"])
+#         return next(iter(sweep_params))
 
-    def get_sweep_values(self) -> list[Any]:
-        """Get the swept parameter's values, ordered by collection_index.
+#     def get_sweep_values(self) -> list[Any]:
+#         """Get the swept parameter's values, ordered by collection_index.
 
-        Returns
-        -------
-        list[Any]
-            The swept parameter values.
-        """
-        column = self.get_sweep_column()
-        query = f"SELECT {self._quote(column)} FROM {self._quote(self.acoustics_table)} ORDER BY collection_index"
-        return [r[0] for r in self.connection.execute(query)]
+#         Returns
+#         -------
+#         list[Any]
+#             The swept parameter values.
+#         """
+#         column = self.get_sweep_column()
+#         query = f"SELECT {self._quote(column)} FROM {self._quote(self.acoustics_table)} ORDER BY collection_index"
+#         return [r[0] for r in self.connection.execute(query)]
 
-    def fetch_collection_index_by_value(self, value: Any) -> int:
-        """Fetch the collection_index matching a swept parameter value.
+#     def fetch_collection_index_by_value(self, value: Any) -> int:
+#         """Fetch the collection_index matching a swept parameter value.
 
-        Parameters
-        ----------
-        value : Any
-            The swept parameter value to look up.
+#         Parameters
+#         ----------
+#         value : Any
+#             The swept parameter value to look up.
 
-        Returns
-        -------
-        int
-            The matching collection_index.
-        """
-        column = self.get_sweep_column()
-        query = f"SELECT collection_index FROM {self._quote(self.acoustics_table)} WHERE {self._quote(column)}=?"
-        row = self.connection.execute(query, (value,)).fetchone()
-        if row is None:
-            raise ValueError(f"No collection_index found for {column}={value}")
-        return int(row[0])
+#         Returns
+#         -------
+#         int
+#             The matching collection_index.
+#         """
+#         column = self.get_sweep_column()
+#         query = f"SELECT collection_index FROM {self._quote(self.acoustics_table)} WHERE {self._quote(column)}=?"
+#         row = self.connection.execute(query, (value,)).fetchone()
+#         if row is None:
+#             raise ValueError(f"No collection_index found for {column}={value}")
+#         return int(row[0])
 
 
-# TODO: build out and integrate with visualization classes    
-class AcousticScanFrequencyDomainDatabase(AcousticDatabase):
-    """A class for handling frequency domain data in an acoustics database."""
+# # TODO: build out and integrate with visualization classes    
+# class AcousticScanFrequencyDomainDatabase(AcousticDatabase):
+#     """A class for handling frequency domain data in an acoustics database."""
      
-class AcousticDatabaseCWT(AcousticDatabaseFrequencyDomain):
-    """A class for handling continuous wavelet transform data in an acoustics database.
+# class AcousticDatabaseCWT(AcousticDatabaseFrequencyDomain):
+#     """A class for handling continuous wavelet transform data in an acoustics database.
 
-    This class extends the AcousticsDatabaseFrequencyDomain class to provide additional functionality
-    for working with continuous wavelet transform data.
-    """
+#     This class extends the AcousticsDatabaseFrequencyDomain class to provide additional functionality
+#     for working with continuous wavelet transform data.
+#     """
 
-class AcousticDatabaseTMM(AcousticDatabaseFrequencyDomain):
-    """A class for handling time-frequency map data in an acoustics database.
+# class AcousticDatabaseTMM(AcousticDatabaseFrequencyDomain):
+#     """A class for handling time-frequency map data in an acoustics database.
 
-    This class extends the AcousticsDatabase class to provide additional functionality
-    for working with time-frequency map data.
-    """
+#     This class extends the AcousticsDatabase class to provide additional functionality
+#     for working with time-frequency map data.
+#     """

@@ -1,71 +1,125 @@
 import h5py
 import numpy as np
-import holoviews as hv
-import panel as pn
-import param
-from holoviews import streams
 from functools import lru_cache
+
+import param
+import panel as pn
+import holoviews as hv
+from holoviews import streams
+
 from bokeh.models import CustomJSTickFormatter
 
-# Initialize HoloViews with Bokeh backend
-hv.extension('bokeh')
 
-class AcousticScanViewer(param.Parameterized):
+
+class AcousticViewer(param.Parameterized):
+    # put tracked parameters here
+
+    # -------------------------------------------------------------------------
+    # Magic Methods
+    # -------------------------------------------------------------------------
+    
+    def __init__(self, db, from_group='preprocessed_data', **params):
+        super().__init__(**params)
+        self.db = db
+        self.from_group = from_group
+        self.labels = db.parameters['waveform_labels']
+        self.h5 = None
+        self._is_open = False
+        
+        self.open()
+        
+    def __enter__(self):
+        self.open()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    # -------------------------------------------------------------------------
+    # Database management
+    # -------------------------------------------------------------------------
+    
+    def open(self):
+        if self._is_open: return
+
+        self.h5 = h5py.File(self.db.h5_name, 'r')
+        self._open_datasets()
+        self._is_open = True
+
+    def close(self):
+        if not self._is_open: return
+        self._close_datasets()
+        self.clear_cache()
+        if self.h5 is not None: self.h5.close()
+        self.h5 = None
+        self._is_open = False
+        print("AcousticViewer closed and cache cleared.")
+
+    def clear_cache(self): pass # call .cache_clear() on all methods with header @lrucache
+
+    def _open_datasets(self): raise NotImplementedError # methods for setting self.datasets, self.shape, self.time,
+
+    def _close_datasets(self): pass
+    
+    # -------------------------------------------------------------------------
+    # Data Fetchers/ Interactive grid components
+    # -------------------------------------------------------------------------
+    
+    # -------------------------------------------------------------------------
+    # Dashboard
+    # -------------------------------------------------------------------------
+    
+    def create_dashboard(self): raise NotImplementedError
+
+    @classmethod
+    def launch(cls, **kwargs):
+        with cls(**kwargs) as visualizer:
+            server = pn.serve( visualizer.create_dashboard(), show=True, threaded=True )
+            try: input("Use the viewer, then press Enter here to close it...")
+            finally: server.stop()
+            
+            
+class AcousticScanViewer(AcousticViewer):
     current_x = param.Integer(default=0)
     current_z = param.Integer(default=0)
     current_y = param.Integer(default=0)
-
+    
+    # -------------------------------------------------------------------------
+    # Magic Methods
+    # -------------------------------------------------------------------------
+    
     def __init__(self, db, from_group='preprocessed_data', **params):
-        """
-        Parameters:
-        -----------
-        db : AcousticDatabase class
-        """
-        super().__init__()
-        self.db = db
-        self.labels = db.parameters['waveform_labels']
-        self.from_group = from_group
+        super().__init__(db, from_group, **params)
+        
         self.aspect_ratio = 10
         self._spatial_tap_streams = {}
         self._waveform_tap_stream = None
         
-        self.file = None
-        self._is_open = False
-        
-        # Reactive global states for tracking crosshairs/slices without static sliders
         self.current_x = db.shape[1] // 2
         self.current_z = db.shape[2] // 2
         self.current_y = db.shape[3] // 2
         
-        self.open_reader()
+    # -------------------------------------------------------------------------
+    # Database management
+    # -------------------------------------------------------------------------
 
-    def __enter__(self) -> 'AcousticScanViewer':
-        self.open_reader()
-        return self
+    def clear_cache(self): self._fetch_1d_waveform.cache_clear()    
+    
+    def _open_datasets(self):
+        group = f"/{self.from_group}"
+        self.acoustic_ds = self.h5[f"{group}/waveforms"]
+        self.hilbert_ds = self.h5[f"{group}/hilbert"]
+        
+        self.shape = self.h5[f"{group}/waveforms"].shape
+        self.time = self.acoustic_ds.attrs['time_array']
 
-    def __exit__(self):
-        self.close()
-
-    def open_reader(self):
-        """Opens H5 file read-only and automatically builds dynamic indices."""
-        if not self._is_open:
-            self.h5 = h5py.File(self.db.h5_name, 'r')
-            self.acoustic_ds = self.h5[f"/{self.from_group}/waveforms"]
-            self.hilbert_ds = self.h5[f"/{self.from_group}/hilbert"]
-            self.time = self.acoustic_ds.attrs['time_array']
-            self.acoustic_ds.attrs['time_array']
-            self.shape = self.acoustic_ds.shape
-            self._is_open = True
-            
-            # Ensure the provided labels match the actual dimension length
-            if len(self.labels) != self.shape[0]: self.labels = [f"Waveform Index {i}" for i in range(self.shape[0])]
-
-    def close(self):
-        if self._is_open and self.h5 is not None:
-            self.h5.close()
-            self.clear_cache()
-            self.h5 = None
-            self._is_open = False
+    def _close_datasets(self):
+        self.acoustic_ds = None
+        self.hilbert_ds = None
+    
+    # -------------------------------------------------------------------------
+    # Data Fetchers
+    # -------------------------------------------------------------------------
 
     def get_2d_slice(self, w: int, y: int, dataset: str = 'hilbert') -> np.ndarray:
         if dataset == 'hilbert': source = self.hilbert_ds
@@ -77,12 +131,11 @@ class AcousticScanViewer(param.Parameterized):
     def _fetch_1d_waveform(self, w: int, x: int, z: int): return self.acoustic_ds[w, x, z, :], self.hilbert_ds[w, x, z, :]
 
     def get_1d_waveform(self, w: int, x: int, z: int) -> tuple: return self._fetch_1d_waveform(int(w), int(x), -int(z))
-
-    def clear_cache(self): self._fetch_1d_waveform.cache_clear()
-
+    
     # -------------------------------------------------------------------------
-    # 2D SPATIAL SCAN GRID COMPONENT
+    # 2D Image Plot 
     # -------------------------------------------------------------------------
+    
     #TODO: get rid of prints
     def build_spatial_grid(self, direction_idx: int, dataset: str = 'hilbert'):
         """
@@ -132,7 +185,7 @@ class AcousticScanViewer(param.Parameterized):
         return dynamic_grid
 
     # -------------------------------------------------------------------------
-    # 1D WAVEFORM OVERLAY VIEW
+    # 1D Waveform Plot
     # -------------------------------------------------------------------------
     
     def build_overlay_waveform_plot(self):
@@ -204,7 +257,7 @@ class AcousticScanViewer(param.Parameterized):
         return waveform_map
 
     # -------------------------------------------------------------------------
-    # MAIN LAYOUT COMPOSER
+    # Dashboard
     # -------------------------------------------------------------------------
     def create_dashboard(self):
         """Assembles dynamically computed items into an integrated control dashboard."""
@@ -224,8 +277,6 @@ class AcousticScanViewer(param.Parameterized):
             )
         )
         return dashboard_layout
-
-
 
 
 
