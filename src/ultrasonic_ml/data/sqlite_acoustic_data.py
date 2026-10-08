@@ -9,26 +9,25 @@ from pathlib import Path
 from typing import Any, Iterator    
 import math
 import numpy as np  
-from scipy.signal import butter, sosfiltfilt, hilbert
+from scipy.signal import butter, sosfiltfilt, hilbert, find_peaks
 from tqdm import tqdm
 
-from ..utils import profile 
+from ..utils import profile, NumpyEncoder 
 import time
 
+import h5py
+import matplotlib.pyplot as plt
+import pprint
 
-# Done
-class AcousticsDatabase: 
-    #TODO: future consideration, deserializing blob is bottleneck. 
-    # consider hdf5 with sqlite as metadata.
-    # TODO: calculate maxes using hilbert window instead of our minmax
+class AcousticSQlite: 
     """Base class for SQLite acoustics data and analysis."""
 
-    def __init__(self, database_path: str | Path) -> None:
+    def __init__(self, path: str | Path) -> None:
         """Initialize the AcousticsDatabase.
 
         Parameters
         ----------
-        database_path : str | Path
+        path : str | Path
             The path to the SQLite database file.
         """
         
@@ -40,46 +39,23 @@ class AcousticsDatabase:
             "BLOB": bytes,
             "NULL": type(None),
         }
-        self.database_path = database_path
+        self.path = path
         self.connection: sqlite3.Connection | None = None
         self.cursor: sqlite3.Cursor | None = None
         self.acoustics_table = "acoustics"
         self.parameters_table = "parameters"
-        self.analysis_table = "analysis"
-        self.reference_table = "analysis_reference"
-        self.index_column = "collection_index"
-        self.parameters = {}
-        self.waveform_columns = []
-        self.dt = None
-        self.f_s = None
-        self.f = None
-        self.omega_scaled = None
-        self.absolute_max = {}
-        self.absolute_max_overall = None
-        self._cache_enabled = True
-        self._cache: dict[tuple[Any, ...], Any] = {}
 
         self.connect()
-        print('setting paramters')
+        # print('setting parameters')
         self.waveform_columns = self.get_waveform_columns()
-        self.parameters = self.get_parameters()
+        self.parameters = self.get_sqlite_parameters()
         self.initialize_frequency_parameters()
-        print('creating analysis and reference tables if they don\'t exist')
-        self.create_analysis_table()
-        self.create_reference_table()
-        print('computing maxes')
-        self.raw_maxs_ = {}
-        self.analysis_maxs_ = {}
-        self._compute_raw_maxs()
-        # self._compute_analysis_maxs()
-        # self.calculate_hilbert_raw()
-        # TODO: add methods for deleting columns, tables, and reindexing.
 
     # -------------------------------------------------------------------------
     # Database
     # -------------------------------------------------------------------------
 
-    def __enter__(self) -> AcousticsDatabase:
+    def __enter__(self) -> AcousticsSQlite:
         """Enter the context manager.
 
         Returns
@@ -127,7 +103,7 @@ class AcousticsDatabase:
     def connect(self) -> None:
         """Connect to the SQLite database.
         """
-        self.connection = sqlite3.connect(self.database_path, detect_types=sqlite3.PARSE_DECLTYPES)
+        self.connection = sqlite3.connect(self.path, detect_types=sqlite3.PARSE_DECLTYPES)
         self.cursor = self.connection.cursor()
 
     def close(self) -> None:
@@ -211,7 +187,7 @@ class AcousticsDatabase:
     # Parameters
     # -------------------------------------------------------------------------
 
-    def get_parameters(self) -> dict[str, Any]:
+    def get_sqlite_parameters(self) -> dict[str, Any]:
         """Get the parameters from the parameters table.
 
         Returns
@@ -248,28 +224,6 @@ class AcousticsDatabase:
                 self._write_parameter(key, value)
 
         self.parameters.update({k: v for k, v in values.items() if v is not None})
-
-    def get_datetime(self, row: int = 0) -> datetime:
-        """Get the datetime of a specific acquisition.
-
-        Parameters
-        ----------
-        row : int, optional
-            The row index of the acquisition, by default 0.
-
-        Returns
-        -------
-        datetime
-            The datetime of the acquisition.
-        """
-        value = self.fetch_value("time_collected", row)
-        if isinstance(value, datetime):
-            return value
-        if isinstance(value, str):
-            return datetime.fromisoformat(value)
-        if isinstance(value, (int, float, np.number)):
-            return datetime.fromtimestamp(float(value))
-        raise TypeError(f"Unsupported time_collected type: {type(value)}")
 
     # -------------------------------------------------------------------------
     # Raw Waveforms
@@ -310,32 +264,6 @@ class AcousticsDatabase:
         self.connection.executemany(query, zip(collection_index, value))
         self.connection.commit()
 
-    def get_waveform_columns(self) -> list[str]:
-        """Get the list of waveform columns in the acoustics table.
-
-        Returns
-        -------
-        list[str]
-            A list of waveform column names.
-        """
-        excluded = {"collection_index", "X", "Z", "time", "time_collected", "frequency"}
-        return [c for c in self.get_columns(self.acoustics_table) if c.startswith("voltage") and c not in excluded]
-
-    def has_waveform(self, waveform: str) -> bool:
-        """Check if a waveform column exists in the acoustics table.
-
-        Parameters
-        ----------
-        waveform : str
-            The name of the waveform column.
-
-        Returns
-        -------
-        bool
-            True if the waveform column exists, False otherwise.
-        """
-        return waveform in self.waveform_columns
-
     def fetch_waveform(self, waveform: str, row: int) -> np.ndarray:
         """Fetch a waveform from the acoustics table.
 
@@ -352,8 +280,7 @@ class AcousticsDatabase:
             The waveform as a NumPy array.
         """
         
-        if not self.has_waveform(waveform):
-            raise ValueError(f"Unknown waveform: {waveform}")
+        self._check_column('acoustics', waveform)
         return self.deserialize_array(self.fetch_value(waveform, row))
 
     def fetch_waveform_batch(self, waveform: str, rows: Any) -> list[np.ndarray]:
@@ -373,6 +300,17 @@ class AcousticsDatabase:
         """
         return [self.fetch_waveform(waveform, int(row)) for row in rows]
 
+    def get_waveform_columns(self) -> list[str]:
+        """Get the list of waveform columns in the acoustics table.
+
+        Returns
+        -------
+        list[str]
+            A list of waveform column names.
+        """
+        excluded = {"collection_index", "X", "Z", "time", "time_collected", "frequency"}
+        return [c for c in self.get_columns(self.acoustics_table) if c.startswith("voltage") and c not in excluded]
+
     def fetch_time(self, row: int = 0) -> np.ndarray:
         """Fetch the time array from the acoustics table.
 
@@ -388,43 +326,6 @@ class AcousticsDatabase:
         """
         return self.deserialize_array(self.fetch_value("time", row))
 
-    def fetch_waveform_value(self, waveform: str, index: int, row: int) -> float:
-        """Fetch a specific value from a waveform at a given index and row.
-
-        Parameters
-        ----------
-        waveform : str
-            The name of the waveform column.
-        index : int
-            The index of the value in the waveform array.
-        row : int
-            The row index of the acquisition.
-
-        Returns
-        -------
-        float
-            The value from the waveform at the specified index and row.
-        """
-        return float(self.fetch_waveform(waveform, row)[index])
-
-    def fetch_index_across_acquisitions(self, waveform: str, index: int) -> np.ndarray:
-        """Fetch a specific index value from a waveform across all acquisitions.
-
-        Parameters
-        ----------
-        waveform : str
-            The name of the waveform column.
-        index : int
-            The index of the value in the waveform array.
-
-        Returns
-        -------
-        np.ndarray
-            A NumPy array of values from the waveform at the specified index across all acquisitions.
-        """
-        query = f"SELECT {self._quote(waveform)} FROM {self._quote(self.acoustics_table)}"
-        return np.asarray([self.deserialize_array(r[0])[index] for r in self.connection.execute(query)])
-
     def get_acquisition_count(self) -> int:
         """Get the total number of acquisitions in the acoustics table.
 
@@ -436,756 +337,6 @@ class AcousticsDatabase:
         
         query = f"SELECT COUNT(*) FROM {self._quote(self.acoustics_table)}"
         return int(self.connection.execute(query).fetchone()[0])
-
-    def get_acquisition_index(self, row: int) -> int:
-        """Get the collection index of a specific acquisition.
-
-        Parameters
-        ----------
-        row : int
-            The row index of the acquisition.
-
-        Returns
-        -------
-        int
-            The collection index of the acquisition.
-        """
-        return int(self.fetch_value(self.index_column, row))
-    
-    def _compute_raw_maxs(self) -> None:
-        for waveform in self.waveform_columns:
-            column = f"max_{waveform}"
-            if column in self.get_columns(self.acoustics_table):
-                print(f"Skipping {column} as it already exists.")
-                continue
-            
-            print(f"Computing maxs for {waveform}...")
-            self._add_column(column, self.acoustics_table)
-
-            query = f"SELECT collection_index,{self._quote(waveform)} FROM {self._quote(self.acoustics_table)}"
-            rows = self.connection.execute(query).fetchall()
-
-            update_query = f"""
-                UPDATE {self._quote(self.acoustics_table)}
-                SET {self._quote(column)}=?
-                WHERE collection_index=?
-            """
-            params = [(self._absolute_max(self.deserialize_array(blob)), collection_index) for collection_index, blob in rows]
-            self.connection.executemany(update_query, params)
-
-        self.connection.commit()
-        self.set_global_raw_maxes()
-    
-    @profile
-    def set_global_raw_maxes(self) -> None: # test
-        print('Setting global raw maxes...')
-        for waveform in self.waveform_columns:        
-            self.raw_maxs_[waveform] = self.connection.execute(f"""
-                SELECT MAX(max_{waveform}) FROM {self._quote(self.acoustics_table)}
-                """).fetchone()[0]
-            
-    # -------------------------------------------------------------------------
-    # Preprocessing functions
-    # -------------------------------------------------------------------------
-    
-    @staticmethod
-    def _absolute_max(waveform: np.ndarray) -> float:
-        """Calculate the absolute maximum of a waveform.
-
-        Parameters
-        ----------
-        waveform : np.ndarray
-            The waveform data.
-
-        Returns
-        -------
-        float
-            The absolute maximum of the waveform.
-        """
-        return float(np.max(np.abs(waveform)))
-
-    @staticmethod
-    def _hilbert_window(waveform: np.ndarray) -> float:
-        """Calculate the Hilbert window of a waveform.
-
-        Parameters
-        ----------
-        waveform : np.ndarray
-            The waveform data.
-
-        Returns
-        -------
-        np.float64
-            The Hilbert window of the waveform.
-        """
-        hilbert_transform = hilbert(waveform)
-        return float(np.max(np.abs(hilbert_transform)))
-    
-    def _undo_gain(self, waveform: np.ndarray, gain: float, offset: float = 0.0) -> np.ndarray:
-        """Undo the gain and offset applied to a waveform.
-
-        Parameters
-        ----------
-        waveform : np.ndarray
-            The waveform data.
-        gain : float
-            The gain value to undo.
-        offset : float, optional
-            The offset value to undo, by default 0.0.
-
-        Returns
-        -------
-        np.ndarray
-            The waveform with the gain and offset undone.
-        """
-        return (waveform - offset) / gain
-
-    def _butterworth_filter(self, waveform: np.ndarray, lower_fs_coeff: float = 1/250, upper_fs_coeff: float = 1/5, order: int = 3, sos: Any | None = None) -> np.ndarray:
-        """Apply a Butterworth bandpass filter to the waveform.
-
-        Parameters
-        ----------
-        waveform : np.ndarray
-            The waveform data.
-        lower_fs_coeff : float, optional
-            The lower frequency coefficient, by default 1/250.
-        upper_fs_coeff : float, optional
-            The upper frequency coefficient, by default 1/5.
-        order : int, optional
-            The order of the filter, by default 3.
-        sos : Any | None, optional
-            The second-order sections of the filter, by default None.
-
-        Returns
-        -------
-        np.ndarray
-            The filtered waveform.
-        """
-        if self.f_s is None:
-            raise ValueError("Sampling frequency is unavailable")
-
-        if sos is None:
-            sos = butter(order, [self.f_s * lower_fs_coeff, self.f_s * upper_fs_coeff], btype="bandpass", fs=self.f_s, output="sos")
-
-        return sosfiltfilt(sos, waveform)
-    
-    def _build_filter_sos(self, lower_fs_coeff: float, upper_fs_coeff: float, filter_order: int) -> Any:
-        """Build Butterworth bandpass filter coefficients.
-
-        Parameters
-        ----------
-        lower_fs_coeff : float
-            Highpass filter lower limit of C*f_s.
-        upper_fs_coeff : float
-            Lowpass filter upper limit of C*f_s.
-        filter_order : int
-            The order of the filter.
-
-        Returns
-        -------
-        Any
-            The second-order sections of the filter.
-        """
-        if self.f_s is None:
-            raise ValueError("Sampling frequency is unavailable")
-        return butter(filter_order, [self.f_s * lower_fs_coeff, self.f_s * upper_fs_coeff], btype="bandpass", fs=self.f_s, output="sos")
-
-    def _apply_preprocessing_pipeline(self, waveform: np.ndarray, gain: float | None, offset: float, sos: Any | None, apply_ungain: bool, apply_filter: bool, lower_fs_coeff: float, upper_fs_coeff: float, filter_order: int) -> np.ndarray:
-        """Apply ungain and/or filtering to a waveform.
-
-        Parameters
-        ----------
-        waveform : np.ndarray
-            The waveform data.
-        gain : float | None
-            The gain value to undo.
-        offset : float
-            The offset value to undo.
-        sos : Any | None
-            Precomputed filter coefficients, if any.
-        apply_ungain : bool
-            Whether to remove gain.
-        apply_filter : bool
-            Whether to apply a filter.
-        lower_fs_coeff : float
-            Highpass filter lower limit of C*f_s.
-        upper_fs_coeff : float
-            Lowpass filter upper limit of C*f_s.
-        filter_order : int
-            The order of the filter.
-
-        Returns
-        -------
-        np.ndarray
-            The processed waveform.
-        """
-        if apply_ungain: waveform = self._undo_gain(waveform, gain, offset)
-        if apply_filter: waveform = self._butterworth_filter(waveform, lower_fs_coeff, upper_fs_coeff, filter_order, sos)
-        return waveform
-
-    def _fetch_preprocess_rows(self, waveform: str, gain_column: str | None, offset_column: str | None) -> Iterator[tuple[int, np.ndarray, float | None, float]]:
-        """Fetch rows needed for preprocessing a waveform.
-
-        Parameters
-        ----------
-        waveform : str
-            The name of the waveform column.
-        gain_column : str | None
-            The name of the gain column, if any.
-        offset_column : str | None
-            The name of the offset column, if any.
-
-        Yields
-        ------
-        tuple[int, np.ndarray, float | None, float]
-            collection_index, waveform_data, gain, offset for each row.
-        """
-        columns = [self._quote(waveform)]
-        if gain_column: columns.append(self._quote(gain_column))
-        if offset_column: columns.append(self._quote(offset_column))
-
-        query = f"SELECT collection_index,{','.join(columns)} FROM {self._quote(self.acoustics_table)} ORDER BY collection_index"
-
-        for row in self.connection.execute(query):
-            collection_index, blob = row[:2]
-            waveform_data = self.deserialize_array(blob).astype(np.float32, copy=False)
-            i = 2
-            gain = float(row[i]) if gain_column else None
-            if gain_column:
-                i += 1
-            offset = float(row[i]) if offset_column else 0.0
-            yield collection_index, waveform_data, gain, offset
-  
-    def preprocess_waveform(self, waveform: str, apply_ungain: bool = False, apply_filter: bool = False, gain_column: str | None = None, offset_column: str | None = None, lower_fs_coeff: float = 1/250, upper_fs_coeff: float = 1/5, filter_order: int = 3) -> int:
-        if not self.has_waveform(waveform): raise ValueError(f"Unknown waveform: {waveform}")
-        if apply_ungain and gain_column is None: raise ValueError("gain_column is required when apply_ungain=True")
-        if not apply_ungain: gain_column = None
-        if apply_filter and self.f_s is None: raise ValueError("Sampling frequency is unavailable")
-        if not apply_filter: lower_fs_coeff = upper_fs_coeff = filter_order = None
-
-        sos = self._build_filter_sos(lower_fs_coeff, upper_fs_coeff, filter_order) if apply_filter else None
-
-        metadata = {
-            "apply_ungain": apply_ungain,
-            "apply_filter": apply_filter,
-            "lower_fs_coeff": lower_fs_coeff,
-            "upper_fs_coeff": upper_fs_coeff,
-            "filter_order": filter_order,
-        }
-
-        reference_id = self.create_reference("preprocessed", "preprocessed", metadata=metadata)
-
-        rows = []
-        for collection_index, waveform_data, gain, offset in tqdm(self._fetch_preprocess_rows(waveform, gain_column, offset_column), total=len(self), desc=f"Preprocessing {waveform}"):
-            if self._analysis_exists(collection_index, waveform, "preprocessed", "waveform", reference_id):
-                continue
-
-            waveform_data = self._apply_preprocessing_pipeline(waveform_data, gain, offset, sos, apply_ungain, apply_filter, lower_fs_coeff, upper_fs_coeff, filter_order)
-            rows.append((collection_index, waveform, "preprocessed", "waveform", waveform_data, "time", "ns", "voltage", "mV", reference_id))
-
-        self.store_analysis_results_batch(rows)
-        self.calculate_hilbert_analysis(source_analysis_name="preprocessed", source_result_name="waveform", reference_id=reference_id)
-        self.connection.commit()
-        
-        self._compute_analysis_maxs(lazy=True)
-        return reference_id
-    
-    def fetch_preprocessed_waveform(self, waveform: str, row: int, reference_id: int | None = None) -> np.ndarray:
-        """Fetch the preprocessed waveform for a specific acquisition.
-
-        Parameters
-        ----------
-        waveform : str
-            The name of the waveform.
-        row : int
-            The row index of the acquisition.
-        reference_id : int | None, optional
-            The reference ID, by default None.
-
-        Returns
-        -------
-        np.ndarray
-            The preprocessed waveform.
-        """
-        collection_index = self.get_acquisition_index(row)
-        query = f"SELECT value FROM {self._quote(self.analysis_table)} WHERE collection_index=? AND waveform=? AND analysis_name='preprocessed' AND result_name='waveform'"
-        params = [collection_index, waveform]
-
-        if reference_id is not None:
-            query += " AND reference_id=?"
-            params.append(reference_id)
-
-        query += " ORDER BY rowid DESC LIMIT 1"
-        result = self.connection.execute(query, params).fetchone()
-
-        if result is None:
-            raise ValueError(f"No preprocessed waveform for {waveform}, row={row}")
-
-        return self.deserialize_array(result[0])
-
-    def calculate_hilbert_raw(self) -> None:
-        """Compute the Hilbert window for a waveform's raw data.
-
-        Parameters
-        ----------
-        waveform : str
-            The waveform name.
-        """
-        for waveform in self.waveform_columns:
-            reference_id = self.create_reference("hilbert_window", None, metadata={})
-
-            results = []
-            for row in tqdm(range(len(self)), desc=f"Hilbert transform for {waveform}"):
-                collection_index = self.get_acquisition_index(row)
-                if self._analysis_exists(collection_index, waveform, "hilbert_window", "raw", reference_id): continue
-                waveform_ = self.fetch_waveform(waveform, row)
-                results.append((collection_index, waveform, 
-                                "hilbert_window", "raw",
-                                self._hilbert_window(waveform_),
-                                "time", "ns", "voltage", "mV", 
-                                reference_id))
-            self.store_analysis_results_batch(results)
-        self.connection.commit()
-        
-    def calculate_hilbert_analysis(self, source_analysis_name: str = "preprocessed", source_result_name: str = "waveform", reference_id: int | None = 1) -> None:
-        """Compute the Hilbert window for a waveform's stored analysis results.
-
-        Parameters
-        ----------
-        waveform : str
-            The waveform name.
-        source_analysis_name : str, optional
-            The analysis_name to read input data from, by default "preprocessed".
-        source_result_name : str, optional
-            The result_name to read input data from, by default "waveform".
-        reference_id : int | None, optional
-            The reference_id to read input data from, by default None.
-
-        Returns
-        -------
-        int
-            The reference ID of the hilbert_window analysis.
-        """
-        for waveform in self.waveform_columns:
-            hilbert_reference_id = self.create_reference("hilbert_window", None, metadata={})
-            combined_result_name = f"{source_analysis_name}_{source_result_name}"
-            results = []
-            analysis_batch = self.fetch_analysis_values_batch(waveform, source_analysis_name, source_result_name, reference_id)
-            for collection_index, waveform_ in tqdm(analysis_batch, total=len(self), desc=f"Hilbert transform for {waveform}" ):
-                if self._analysis_exists(collection_index, waveform, "hilbert_window", combined_result_name, hilbert_reference_id): continue
-                results.append((collection_index, waveform, 
-                                "hilbert_window", combined_result_name,
-                                self._hilbert_window(waveform_), 
-                                "time", "ns", "voltage", "mV", hilbert_reference_id))
-
-            self.store_analysis_results_batch(results)
-        self.connection.commit()
-            
-    # -------------------------------------------------------------------------
-    # Analysis
-    # -------------------------------------------------------------------------
-    
-    def _analysis_exists(self, collection_index: int, waveform: str, analysis_name: str, result_name: str, reference_id: int | None) -> bool:
-        """Check if an analysis result already exists.
-
-        Parameters
-        ----------
-        collection_index : int
-            The index of the collection.
-        waveform : str
-            The waveform name.
-        analysis_name : str
-            The name of the analysis.
-        result_name : str
-            The name of the result.
-        reference_id : int | None
-            The reference ID.
-
-        Returns
-        -------
-        bool
-            True if a matching row already exists.
-        """
-        query = f"""
-            SELECT 1 FROM {self._quote(self.analysis_table)}
-            WHERE collection_index=? AND waveform=? AND analysis_name=? AND result_name=? AND reference_id IS ?
-            LIMIT 1
-        """
-        return self.connection.execute(query, (collection_index, waveform, analysis_name, result_name, reference_id)).fetchone() is not None
-
-    def create_analysis_table(self) -> None:
-        """Create the analysis table in the SQLite database if it does not exist.
-        """
-        self.connection.execute(f"""
-            CREATE TABLE IF NOT EXISTS {self._quote(self.analysis_table)} (
-                collection_index INTEGER NOT NULL,
-                waveform TEXT NOT NULL,
-                analysis_name TEXT NOT NULL,
-                result_name TEXT NOT NULL,
-                value BLOB,
-                x_axis TEXT,
-                x_unit TEXT,
-                y_axis TEXT,
-                y_unit TEXT,
-                max_value REAL,
-                reference_id INTEGER,
-                PRIMARY KEY (collection_index,waveform,analysis_name,result_name,reference_id)
-            )
-        """)
-        self.connection.commit()
-    
-    def store_analysis_results_batch(self, rows: list[tuple]) -> None:
-        """Store multiple analysis results in the analysis table.
-
-        Parameters
-        ----------
-        rows : list[tuple]
-            List of tuples: (collection_index, waveform, analysis_name, result_name, value, x_axis, x_unit, y_axis, y_unit, reference_id).
-        """
-        params = []
-        for collection_index, waveform, analysis_name, result_name, value, x_axis, x_unit, y_axis, y_unit, reference_id in rows:
-            if isinstance(value, np.ndarray):
-                value = self.serialize_array(value)
-            params.append((collection_index, waveform, analysis_name, result_name, value, x_axis, x_unit, y_axis, y_unit, reference_id))
-
-        query = f"""
-            INSERT OR REPLACE INTO {self._quote(self.analysis_table)}
-            (collection_index,waveform,analysis_name,result_name,value,x_axis,x_unit,y_axis,y_unit,reference_id)
-            VALUES (?,?,?,?,?,?,?,?,?,?)
-        """
-        self.connection.executemany(query, params)
-
-    def store_analysis_result(self, collection_index: int, waveform: str, analysis_name: str, result_name: str, value: Any, x_axis: str | None = None, x_unit: str | None = None, y_axis: str | None = None, y_unit: str | None = None, reference_id: int | None = None) -> None:
-        """Store a single analysis result in the analysis table.
-
-        Parameters
-        ----------
-        collection_index : int
-            The index of the collection.
-        waveform : str
-            The waveform data.
-        analysis_name : str
-            The name of the analysis.
-        result_name : str
-            The name of the result.
-        value : Any
-            The value of the result.
-        x_axis : str | None, optional
-            The x-axis label, by default None.
-        x_unit : str | None, optional
-            The x-axis unit, by default None.
-        y_axis : str | None, optional
-            The y-axis label, by default None.
-        y_unit : str | None, optional
-            The y-axis unit, by default None.
-        reference_id : int | None, optional
-            The reference ID, by default None.
-        """
-        self.store_analysis_results_batch([(collection_index, waveform, analysis_name, result_name, value, x_axis, x_unit, y_axis, y_unit, reference_id)])
-    
-    def fetch_analysis_value(self, collection_index: int, waveform: str, analysis_name: str, result_name: str, reference_id: int | None = None) -> Any:
-        """Fetch analysis data result from the analysis table.
-
-        Parameters
-        ----------
-        collection_index : int
-            The index of the collection.
-        waveform : str
-            The waveform data.
-        analysis_name : str
-            The name of the analysis.
-        result_name : str
-            The name of the result.
-        reference_id : int | None, optional
-            The reference ID, by default None.
-
-        Returns
-        -------
-        Any
-            The value of the analysis result.
-        """
-        query = f"""
-            SELECT value FROM {self._quote(self.analysis_table)}
-            WHERE collection_index=? AND waveform=? AND analysis_name=? AND result_name=?
-        """
-
-        params = [collection_index, waveform, analysis_name, result_name]
-
-        if reference_id is not None:
-            query += " AND reference_id=?"
-            params.append(reference_id)
-
-        query += " ORDER BY rowid DESC LIMIT 1"
-        result = self.connection.execute(query, params).fetchone()
-
-        if result is None:
-            raise ValueError("Analysis result not found")
-
-        value = result[0]
-        return self.deserialize_array(value) if isinstance(value, (bytes, bytearray, memoryview)) else value
-
-    def fetch_analysis_values_batch(self, waveform: str, analysis_name: str, result_name: str, reference_id: int | None = None) -> Iterator[tuple[int, Any]]:
-        """Fetch all analysis values for a waveform/analysis/result across all collection indices.
-
-        Parameters
-        ----------
-        waveform : str
-            The waveform name.
-        analysis_name : str
-            The name of the analysis.
-        result_name : str
-            The name of the result.
-        reference_id : int | None, optional
-            The reference ID, by default None.
-
-        Yields
-        ------
-        tuple[int, Any]
-            collection_index, value for each matching row.
-        """
-        
-        query = f"""
-            SELECT collection_index,value FROM {self._quote(self.analysis_table)}
-            WHERE waveform=? AND analysis_name=? AND result_name=? AND reference_id IS ?
-            ORDER BY collection_index
-        """
-        for collection_index, value in self.connection.execute(query, (waveform, analysis_name, result_name, reference_id)):
-            value = self.deserialize_array(value) if isinstance(value, (bytes, bytearray, memoryview)) else value
-            yield collection_index, value
-
-    def list_analysis_results(self, collection_index: int | None = None, waveform: str | None = None, analysis_name: str | None = None, result_name: str | None = None) -> list[dict[str, Any]]:
-        """List analysis results from the analysis table with optional filters.
-
-        Parameters
-        ----------
-        collection_index : int | None, optional
-            The index of the collection to filter by, by default None.
-        waveform : str | None, optional
-            The waveform to filter by, by default None.
-        analysis_name : str | None, optional
-            The analysis name to filter by, by default None.
-        result_name : str | None, optional
-            The result name to filter by, by default None.
-
-        Returns
-        -------
-        list[dict[str, Any]]
-            A list of dictionaries containing the analysis results.
-        """
-        conditions, params = [], []
-
-        if collection_index is not None:
-            conditions.append("collection_index=?")
-            params.append(collection_index)
-        if waveform is not None:
-            conditions.append("waveform=?")
-            params.append(waveform)
-        if analysis_name is not None:
-            conditions.append("analysis_name=?")
-            params.append(analysis_name)
-        if result_name is not None:
-            conditions.append("result_name=?")
-            params.append(result_name)
-
-        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-
-        query = f"""
-            SELECT collection_index,waveform,analysis_name,result_name,x_axis,x_unit,y_axis,y_unit,reference_id
-            FROM {self._quote(self.analysis_table)} {where}
-            ORDER BY collection_index
-        """
-
-        columns = ["collection_index", "waveform", "analysis_name", "result_name", "x_axis", "x_unit", "y_axis", "y_unit", "reference_id"]
-        return [dict(zip(columns, row)) for row in self.connection.execute(query, params)]
-
-    def unique_tuples(self, column_names: list[str] | tuple[str, ...], table: str | None = None) -> set[tuple[Any, ...]]:
-        """Return the unique tuples for the specified columns.
-
-        Parameters
-        ----------
-        column_names : list[str] | tuple[str, ...]
-            Names of the columns to include in each tuple.
-        table : str | None, optional
-            Table to query. Defaults to the analysis table.
-
-        Returns
-        -------
-        set[tuple[Any, ...]]
-            The distinct combinations of the requested column values.
-        """
-        if not column_names:
-            raise ValueError("column_names must contain at least one column")
-
-        table_name = table or self.analysis_table
-        selected_columns = ",".join(self._quote(column) for column in column_names)
-        query = f"SELECT DISTINCT {selected_columns} FROM {self._quote(table_name)}"
-        return {tuple(row) for row in self.connection.execute(query)}
-    
-    def _compute_analysis_maxs(self, lazy: bool = True) -> None: # TODO: fix this
-        print("Fetching pending...")
-        if lazy: # write non lazer version
-            pending = self.connection.execute(f"""
-                SELECT rowid,waveform,analysis_name,result_name,reference_id,value
-                FROM {self._quote(self.analysis_table)}
-                WHERE max_value IS NULL
-            """).fetchall()       
-        else:
-            pending = self.connection.execute(f"""
-                SELECT rowid,waveform,analysis_name,result_name,reference_id,value
-                FROM {self._quote(self.analysis_table)}
-            """).fetchall()
-        if pending:
-            touched_keys = set()
-            update_params = []
-            for rowid, waveform, analysis_name, result_name, reference_id, value in tqdm(pending, total=len(pending), desc="Computing analysis max values"):
-                data = self.deserialize_array(value) if isinstance(value, (bytes, bytearray, memoryview)) else value
-                row_max = self._absolute_max(data) if isinstance(data, np.ndarray) else abs(float(data))
-                update_params.append((row_max, rowid))
-                touched_keys.add((analysis_name, result_name, reference_id))
-
-            self.connection.executemany(f"""
-                UPDATE {self._quote(self.analysis_table)} SET max_value=? WHERE rowid=?
-            """, update_params)
-            self.connection.commit()
-        self.set_global_analysis_maxs()
-
-    @profile
-    def set_global_analysis_maxs(self) -> None:
-        """Update the maximum values for all analysis results in the database.
-        """
-        print("Updating global analysis max values...")
-        touched_keys = self.unique_tuples(["analysis_name", "result_name", "reference_id"], self.analysis_table)
-
-        for key in touched_keys:
-            # analysis_name, result_name, reference_id = key
-            rows = self.connection.execute(f"""
-                SELECT waveform,MAX(max_value) FROM {self._quote(self.analysis_table)}
-                WHERE analysis_name=? AND result_name=? AND reference_id IS ?
-                GROUP BY waveform
-            """, key).fetchall()
-
-            self.analysis_maxs_.setdefault(key, {}).update(dict(rows))
-            
-    # -------------------------------------------------------------------------
-    # References
-    # -------------------------------------------------------------------------
-
-    def create_reference_table(self) -> None:
-        """Create the analysis reference table in the SQLite database if it does not exist.
-        """
-        
-        self.connection.execute(f"""
-            CREATE TABLE IF NOT EXISTS {self._quote(self.reference_table)} (
-                reference_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                analysis_name TEXT NOT NULL,
-                reference_name TEXT,
-                value BLOB,
-                x_axis BLOB,
-                x_unit TEXT,
-                metadata TEXT
-            )
-        """)
-        self.connection.commit()
-    
-    def _find_reference(self, analysis_name: str, reference_name: str | None, value: Any, x_axis: Any, x_unit: str | None, metadata_json: str | None) -> int | None:
-        """Check for an existing reference matching all fields exactly.
-
-        Returns
-        -------
-        int | None
-            The existing reference_id, or None if no match exists.
-        """
-        row = self.connection.execute(f"""
-            SELECT reference_id FROM {self._quote(self.reference_table)}
-            WHERE analysis_name=? AND reference_name IS ? AND value IS ?
-            AND x_axis IS ? AND x_unit IS ? AND metadata IS ?
-            LIMIT 1
-        """, (analysis_name, reference_name, value, x_axis, x_unit, metadata_json)).fetchone()
-        return int(row[0]) if row else None
-
-    def create_reference(self, analysis_name: str, reference_name: str, value: Any = None, x_axis: Any | None = None, x_unit: str | None = None, metadata: dict[str, Any] | None = None) -> int:
-        """Create a new reference in the SQLite database, or return the existing matching one.
-        """
-        if isinstance(value, np.ndarray):
-            value = self.serialize_array(value)
-        if isinstance(x_axis, np.ndarray):
-            x_axis = self.serialize_array(x_axis)
-        metadata_json = json.dumps(metadata, sort_keys=True) if metadata else None
-
-        existing_id = self._find_reference(analysis_name, reference_name, value, x_axis, x_unit, metadata_json)
-        if existing_id is not None:
-            return existing_id
-
-        query = f"""
-            INSERT INTO {self._quote(self.reference_table)}
-            (analysis_name,reference_name,value,x_axis,x_unit,metadata)
-            VALUES (?,?,?,?,?,?)
-        """
-        cursor = self.connection.execute(query, (analysis_name, reference_name, value, x_axis, x_unit, metadata_json))
-        self.connection.commit()
-        return int(cursor.lastrowid)
-
-    def fetch_reference(self, reference_id: int) -> dict[str, Any]:
-        """Fetch a reference from the SQLite database by its ID.
-
-        Parameters
-        ----------
-        reference_id : int
-            The ID of the reference to fetch.
-
-        Returns
-        -------
-        dict[str, Any]
-            A dictionary containing the reference data.
-        """
-        query = f"""
-            SELECT reference_id,analysis_name,reference_name,value,x_axis,x_unit,metadata
-            FROM {self._quote(self.reference_table)}
-            WHERE reference_id=?
-        """
-
-        row = self.connection.execute(query, (reference_id,)).fetchone()
-
-        if row is None:
-            raise ValueError(f"Reference {reference_id} does not exist")
-
-        value = self.deserialize_array(row[3]) if isinstance(row[3], (bytes, bytearray, memoryview)) else row[3]
-        x_axis = self.deserialize_array(row[4]) if isinstance(row[4], (bytes, bytearray, memoryview)) else row[4]
-
-        return {
-            "reference_id": row[0],
-            "analysis_name": row[1],
-            "reference_name": row[2],
-            "value": value,
-            "x_axis": x_axis,
-            "x_unit": row[5],
-            "metadata": json.loads(row[6]) if row[6] else {},
-        }
-
-    def list_references(self, analysis_name: str | None = None) -> list[dict[str, Any]]:
-        """List all references in the SQLite database for a type of analysis method (fft, cwt, etc).
-
-        Parameters
-        ----------
-        analysis_name : str | None, optional
-            The name of the analysis to filter by, or None to list all references, by default None.
-
-        Returns
-        -------
-        list[dict[str, Any]]
-            A list of dictionaries, each containing a reference's data.
-        """
-        query = f"SELECT reference_id,analysis_name,reference_name FROM {self._quote(self.reference_table)}"
-        params = ()
-
-        if analysis_name is not None:
-            query += " WHERE analysis_name=?"
-            params = (analysis_name,)
-
-        query += " ORDER BY reference_id"
-
-        columns = ["reference_id", "analysis_name", "reference_name"]
-        return [dict(zip(columns, row)) for row in self.connection.execute(query, params)]
 
     # -------------------------------------------------------------------------
     # Serialization
@@ -1319,213 +470,611 @@ class AcousticsDatabase:
         return '"' + identifier.replace('"', '""') + '"'
 
 
-class AcousticsScanDatabase(AcousticsDatabase):
+# TODO: AcousticScanDatabase base class. This does not have real functionality
+class AcousticDatabase:
+    def __init__(self, save_folder: str, h5_name: str, sqlite_path: str | None = None):
+        self.save_folder = save_folder
+        self.h5_name = f'{self.save_folder}/{h5_name}'
+        self.sqlite_database = AcousticSQlite(sqlite_path) if sqlite_path else None
+        self.shape = None
+        self.len = None
+        self.parameters = {}
+        
+        try: 
+            self.load_parameters()
+        except KeyError as e: 
+            print(e)
+            print('Run parameter setup functions')
+            pass
+    
+    __len__ = lambda self: self.len if self.len else len(self.sqlite_database) if self.sqlite_database else 0
+    
+    # -------------------------------------------------------------------------
+    # Database
+    # -------------------------------------------------------------------------
+        
+    def open_h5(self, mode='a'): return h5py.File(self.h5_name, mode)
+    
+    def get_check_group(self, h5, group_name: str):
+        '''Check if the match_first_break group exists and return the waveforms and hilbert data.
+
+        Parameters
+        ----------
+        h5 : h5py.File
+            The open h5py file.
+
+        Returns
+        -------
+        tuple
+            A tuple containing the waveforms and hilbert data.
+        '''
+        try: return h5[group_name]['waveforms'], h5[group_name]['hilbert']
+        except KeyError as e: print(e, f'Run setup for {group_name} first')
+
+    def _print_schema(self, h5, tab: str = ''):
+        for name, obj in h5.items():
+            print(f"{tab}|--{obj}")
+            if isinstance(obj, h5py.Group):
+                self._print_schema(obj, tab + '|  ')
+                
+    def print_schema(self): 
+        with self.open_h5() as h5:
+            print(f"{h5}")
+            self._print_schema(h5)
+    
+    def print_sqlite_schema(self): self.sqlite_database.print_schema()
+    
+    def sqlite_to_h5(self): pass # specific to the child class
+
+    # -------------------------------------------------------------------------
+    # Parameters
+    # -------------------------------------------------------------------------
+        
+    def print_parameters(self):
+        with np.printoptions(threshold=10, edgeitems=2,):
+            # Adjust 'indent' to change tab sizing if needed
+            pprint.pprint(self.parameters, indent=4, compact=True)
+            
+    def get_sqlite_parameters(self): # TODO: finish filling these out. Make template a part of docs page. 
+        # with units and descriptions
+        parameters = {
+            'transducerFrequency': {
+                'value': self.sqlite_database.parameters['transducerFrequency'], 
+                'unit': 'MHz', 'description': 'Transducer center frequency'}, 
+            'measureTime': {
+                'value': self.sqlite_database.parameters['measureTime'], 
+                'unit': 'us', 'description': 'Measurement time'},
+            'measureDelay': {
+                'value': self.sqlite_database.parameters['measureDelay'], 
+                'unit': 'us', 'description': 'Measurement delay'},
+            'voltageRange': {
+                'value': self.sqlite_database.parameters['voltageRange'], 
+                'unit': 'V', 
+                'description': 'Voltage range'},
+            'dt': {
+                'value': self.sqlite_database.parameters['dt'], 
+                'unit': 's', 
+                'description': 'Sampling interval'},
+            'f_s': {
+                'value': self.sqlite_database.parameters['f_s'], 
+                'unit': 'Hz', 
+                'description': 'Sampling frequency'},
+            'experiment': {
+                'value': self.sqlite_database.parameters['experiment'],
+                'description': ''''move': move the transducers/ 'single pulse': perform a single test pulse/ 'repeat pulse': repeat a pulse at a single location for a given time and frequency/ 'single scan': perform a single 2D scan/ 'multi scan': repeat a 2D scan with a set frequency/ 'sweep': repeat pulse changing through parameters given in sweepParameters'''},
+            'pulserPort': {
+                'value': self.sqlite_database.parameters['pulserPort'],
+                'description': 'COM port for the pulser'},
+            'collectionMode': {
+                'value': self.sqlite_database.parameters['collectionMode'],
+                'description': 'transmission/echo/both'},
+            'pulserType': {
+                'value': self.sqlite_database.parameters['pulserType'],
+                'description': ''' 'standard': single wave CompactPulser. 'tone burst': USBUT350 tone burst pulser'''},
+            'multiplexer': {
+                'value': self.sqlite_database.parameters['multiplexer'],
+                'description': 'True/False: whether a multiplexer is used'},
+            'collectionDirection': {
+                'value': self.sqlite_database.parameters['collectionDirection'],
+                'description': 'forward/reverse/both'},
+            'autoRange': {
+                'value': self.sqlite_database.parameters['autoRange'],
+                'description': ''},
+            'autoRangeEcho': {
+                'value': self.sqlite_database.parameters['autoRangeEcho'],
+                'description': ''},
+            'waves': {
+                'value': self.sqlite_database.parameters['waves'],
+                'description': ''},
+            'samples': {
+                'value': self.sqlite_database.parameters['samples'],
+                'description': ''},
+            'picoModule': {
+                'value': self.sqlite_database.parameters['picoModule'],
+                'description': ''},
+            'pulseModule': {
+                'value': self.sqlite_database.parameters['pulseModule'],
+                'description': ''},
+        }
+        
+        # scan specific parameters
+        if parameters['experiment']['value'] == 'single scan' or parameters['experiment']['value'] == 'multi scan':
+            for k in  ['primaryAxis','secondaryAxis']: 
+                parameters[k] = {
+                    'value': self.sqlite_database.parameters[k]}
+            for k in ['primaryAxisRange', 'primaryAxisStep', 'secondaryAxisRange', 'secondaryAxisStep']: 
+                parameters[k] = {
+                    'value': self.sqlite_database.parameters[k], 
+                    'unit': 'mm'}
+        if parameters['experiment']['value'] == 'multi scan': pass # experimentBaseName, 
+        if parameters['experiment']['value'] == 'repeat pulse': pass #     'pulseInterval' : Minimum time between pulse collection, in seconds, 'experimentTime' : 5,                           # For repeat pulse: Time to collect data, in seconds
+
+        if parameters['collectionMode']['value'] == 'transmission': pass # parameters['voltage_offset'] = {'value': self.sqlite_database.parameters['voltage_offset'], 'unit': 'V'}
+        if parameters['collectionMode']['value'] == 'echo': pass # parameters['voltage_offset'] = {'value': self.sqlite_database.parameters['voltage_offset'], 'unit': 'V'}
+        if parameters['collectionMode']['value'] == 'both':     
+            parameters['voltage_gain'] = {
+                'value':{
+                    'forward':self.sqlite_database.parameters['gainForward'], 
+                    'reverse': self.sqlite_database.parameters['gainReverse']} }
+            
+        if parameters['pulserType']['value'] == 'tone burst': 
+            parameters['halfCycles'] = self.sqlite_database.parameters['halfCycles']
+
+        if parameters['multiplexer']['value']:
+            for k in  ['multiplexerPort','rfSwitch', 't0PulseSwitch', 't0ReceiveSwitch', 't1PulseSwitch', 't1ReceiveSwitch']:
+                parameters[k] = self.sqlite_database.parameters[k]
+        
+        ####################################################
+        # To format in the parameters table by index
+        ####################################################
+        if parameters['autoRange']['value']: pass
+        if parameters['autoRangeEcho']['value']: pass
+        
+        ####################################################
+        # for plotting
+        ####################################################        
+        parameters['time_array'] = self.sqlite_database.fetch_time()
+        parameters['waveform_labels'] = self.sqlite_database.waveform_columns
+        
+        return parameters
+                  
+    def save_parameters(self):
+        '''Save the parameters dictionary to the HDF5 file as a JSON string. 
+        Create dataset config_metadata in the root of the HDF5 file if it does not exist.'''
+        with self.open_h5() as h5:
+            json_str = json.dumps(self.parameters, cls=NumpyEncoder) # Convert dictionary to a JSON string
+            dt = h5py.special_dtype(vlen=str) # save as special h5 type
+            try: del h5['config_metadata']  
+            except: pass
+            h5.require_dataset('config_metadata', (), data=json_str, dtype=dt)
+
+    def load_parameters(self):
+        print('Loading h5 parameters...')
+        with self.open_h5() as h5:
+            loaded_json = h5['config_metadata'][()]
+            self.parameters = json.loads(loaded_json)
+            self.parameters['time_array'] = np.array(self.parameters['time_array'])
+            self.shape = tuple(self.parameters['shape'])
+            self.len = self.parameters['len']
+        print('\tFinished.')
+
+    def setup_parameters(self): pass # specific to the child class. must also set time_array, shape, and len
+    
+    # -------------------------------------------------------------------------
+    # Raw data
+    # -------------------------------------------------------------------------
+        
+    def setup_raw_dataset(self):
+        '''Write raw data and parameters to the HDF5 file.
+        
+        Parameters
+        ----------
+        data : np.ndarray
+            The raw data to write.
+        time_array : float
+            The time array.
+        parameters : dict
+            The parameters to write.
+        '''
+
+        with self.open_h5() as h5:
+            grp = h5.require_group('raw_data')
+            waveforms_dset = grp.require_dataset('waveforms', shape=self.shape, dtype='f4', track_order=True)
+            grp.require_dataset('hilbert', shape=self.shape, dtype='f4', track_order=True)
+            waveforms_dset.attrs['time_array'] = self.parameters['time_array']
+            
+    def fill_raw_dataset(self, idx_data : Iterator[tuple[tuple, np.ndarray]]):
+        '''Fill a series of specific locations in the raw data dataset.
+        
+        Parameters
+        ----------
+        idx_data : Iterator[tuple[tuple, np.ndarray]]
+            An iterator of tuples, where each tuple contains an index (tuple) and the corresponding data (np.ndarray) to fill at that index.
+            The index should fill axis until the last dimension, and the data should be a 1D array of shape (time_length,).
+        '''
+        with self.open_h5() as h5: # TODO: calculate the hilbert window and maxes. Look at preprocessed.
+            try: dset = h5['raw_data']['waveforms']
+            except KeyError as e: print(e, 'Run setup_raw_dataset first'); return
+            
+            for idx, data in tqdm(idx_data, desc="Filling raw data", total=math.prod(self.shape[:-1])):
+                dset[idx] = data
+
+    # -------------------------------------------------------------------------
+    # Indexing
+    # -------------------------------------------------------------------------
+    
+    def write_indexed_parameter(self, keys, values, shapes): pass # specific to the child class
+       
+    def load_shape(self): pass # specific to the child class
+    
+    def idx_sqlite_data_generator(self): pass # specific to the child class
+    
+    # fill _ with some combination of whatever axis are in the dataset (w_x_z, x_z, w_y, etc.)
+    def _generator(self): pass # specific to the child class
+
+    # -------------------------------------------------------------------------
+    # Preprocessing
+    # -------------------------------------------------------------------------
+    
+    @staticmethod
+    def _absolute_max(waveform): return float(np.max(np.abs(waveform)))
+
+    @staticmethod
+    def _hilbert_window(waveform): return np.abs(hilbert(waveform))
+
+    @staticmethod
+    def _undo_gain(waveform, gain, offset): return (waveform - offset) / gain
+    
+    def _build_filter_sos(self, lower_fs_coeff: float, upper_fs_coeff: float, filter_order: int) -> Any:
+        """Build Butterworth bandpass filter coefficients.
+
+        Parameters
+        ----------
+        lower_fs_coeff : float
+            Highpass filter lower limit of C*f_s.
+        upper_fs_coeff : float
+            Lowpass filter upper limit of C*f_s.
+        filter_order : int
+            The order of the filter.
+
+        Returns
+        -------
+        Any
+            The second-order sections of the filter.
+        """
+        if self.parameters['f_s']['value'] is None: raise ValueError("Sampling frequency is unavailable")
+        f_s = self.parameters['f_s']['value']
+        return butter(filter_order, [f_s * lower_fs_coeff, f_s * upper_fs_coeff], btype="bandpass", fs=f_s, output="sos")
+
+    def setup_preprocessed_data(self, apply_ungain: bool = False, apply_filter: bool = False, lower_fs_coeff: float = 1/250, upper_fs_coeff: float = 1/5, filter_order: int = 3):
+        '''Setup preprocessed group, dataset, and attributes
+        
+        Parameters
+        ----------
+        apply_ungain : bool
+            Whether to apply ungain to the data.
+        apply_filter : bool
+            Whether to apply a bandpass filter to the data.
+        lower_fs_coeff : float
+            Highpass filter lower limit of C*f_s.
+        upper_fs_coeff : float
+            Lowpass filter upper limit of C*f_s.
+        filter_order : int
+            The order of the filter.
+        '''
+        metadata = {}
+        with self.open_h5() as h5:
+            grp = h5.require_group('preprocessed_data')
+            dset = grp.require_dataset('waveforms', shape=self.shape, dtype='f4', track_order=True)
+            grp.require_dataset('hilbert', shape=self.shape, dtype='f4', track_order=True)
+            
+            if apply_ungain: pass # TODO: later, get gain columns and indices/values from paramters collection mode
+            if apply_filter: 
+                self.sos = self._build_filter_sos(lower_fs_coeff, upper_fs_coeff, filter_order) if apply_filter else None
+                metadata.update({"lower_fs_coeff": lower_fs_coeff, "upper_fs_coeff": upper_fs_coeff, "filter_order": filter_order})
+            
+            dset.attrs.update(metadata)
+            dset.attrs['time_array'] = self.parameters['time_array']
+    
+    def fill_preprocessed_data(self, idxs: Iterator[tuple]) -> None:   
+        '''Fill a series of specific locations in the raw data dataset.
+                
+        Parameters
+        ----------
+        idxs : Iterator[tuple]
+            An iterator of tuples, where each tuple contains an index.
+            The index should fill axis until the last dimension.
+        '''
+        with self.open_h5() as h5:
+            waveform_dset, hilbert_dset = self.get_check_group(h5, 'preprocessed_data')
+            
+            for idx in tqdm(idxs, desc="Writing preprocessed data", total=math.prod(self.shape[:-1])):
+                data = h5['raw_data']['waveforms'][*idx]
+                # if apply_ungain: waveform = self._undo_gain(waveform, gain, offset)
+                try: data = sosfiltfilt(self.sos, data)
+                except: continue
+
+                waveform_dset[*idx] = data
+                hilbert_dset[*idx] = self._hilbert_window(data)
+
+    # -------------------------------------------------------------------------
+    # alignment
+    # -------------------------------------------------------------------------
+    
+    @staticmethod
+    def _calculate_rollback(waveform):
+        '''
+        Calculate the average rollback value fo each of the mean waveforms
+        
+        Parameters:
+        -----------
+        waveform: np.ndarray
+            The waveform data.
+            
+        Returns:
+        --------
+        np.ndarray
+            The mean rollback values for each waveform profile.
+        '''
+        mean_profile = waveform.mean(axis=tuple(i for i in range(1,len(waveform.shape)-1)))
+        peak_distances = np.array([ find_peaks(profile, height=0.25*profile.max())[0][0] for profile in mean_profile ])
+        rollback = peak_distances-min(peak_distances)
+        return rollback
+    
+    def setup_first_break_aligned_data(self, from_group='preprocessed_data'):
+        '''
+        Set up the group storing waveforms aligned by first breakfor the dataset.
+        
+        Parameters
+        ----------
+        from_group : str
+            The name of the group from which to read the waveforms to align.
+        '''
+        if len(self.parameters['waveform_labels'])<2: print('Only one waveform. No need to align peaks'); return
+        if self.parameters['collectionDirection']['value'] != 'both': print('Collection mode is one direction. No need to align peaks'); return
+        
+        with self.open_h5() as h5:
+            self.get_check_group(h5, from_group)
+    
+            rollbacks = self._calculate_rollback(h5[from_group]['hilbert'][:])
+            max_ = rollbacks.max()
+            grp = h5.require_group('first_break_aligned')
+            
+            new_shape = self.shape[:-1] + (self.shape[-1]-max_,)
+            dset = grp.require_dataset('waveforms', shape=new_shape, dtype='f4', track_order=True)
+            grp.require_dataset('hilbert', shape=new_shape, dtype='f4', track_order=True)
+            
+            dset.attrs['from_group'] = str(h5[from_group])
+            dset.attrs['rollbacks'] = rollbacks
+            dset.attrs['time_array'] = self.parameters['time_array'][:-max_]
+  
+    def fill_first_break_aligned_data(self, idxs: Iterator[tuple], from_group='preprocessed_data') -> None:
+        """Align the first break of the waveforms in the dataset and write to new dataset
+
+        Parameters
+        ----------
+        idxs : Iterator[tuple]
+            An iterator of tuples containing indices to span all but first and last axis.
+        from_group : str
+            The name of the group from which to read the waveforms to align.
+        """          
+        with self.open_h5() as h5:
+            waveform_dset_unrolled, hilbert_dset_unrolled = self.get_check_group(h5, from_group)
+            waveform_dset, hilbert_dset = self.get_check_group(h5, 'first_break_aligned')
+            new_shape = hilbert_dset.shape
+            rollbacks = waveform_dset.attrs['rollbacks']
+
+            for idx in tqdm(idxs, desc="Aligning first break", total=math.prod(self.shape[1:-1])):
+                waveform_dset[*idx] = waveform_dset_unrolled[*idx,rollbacks[idx[0]]:new_shape[-1]+rollbacks[idx[0]]]
+                hilbert_dset[*idx] = hilbert_dset_unrolled[*idx,rollbacks[idx[0]]:new_shape[-1]+rollbacks[idx[0]]]
+    
+    # -------------------------------------------------------------------------
+    # Basic viz
+    # -------------------------------------------------------------------------  
+                  
+    def view_mean_raw(self, idx):
+        fig, ax = plt.subplots()
+        with self.open_h5() as h5:
+            data = h5['raw_data']['waveforms']
+            ax.plot(data.attrs['time_array'], data[idx])
+        fig.show()
+  
+
+# Naming convention: AcousticDatabase__ is a subclass of AcousticDatabase that handles __ analysis.   
+class AcousticDatabaseFFT(AcousticDatabase):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        
+    # -------------------------------------------------------------------------
+    # alignment
+    # -------------------------------------------------------------------------
+    
+    @staticmethod
+    def _calculate_rollback(waveform):
+        '''
+        Calculate the average rollback value fo each of the mean waveforms
+        
+        Parameters:
+        -----------
+        waveform: np.ndarray
+            The waveform data.
+            
+        Returns:
+        --------
+        np.ndarray
+            The mean rollback values for each waveform profile.
+        '''
+        mean_profile = waveform.mean(axis=tuple(i for i in range(1,len(waveform.shape)-1)))
+        peak_distances = np.array([ find_peaks(profile, height=0.25*profile.max())[0][0] for profile in mean_profile ])
+        rollback = peak_distances-min(peak_distances)
+        return rollback
+    
+    def setup_first_break_aligned_data(self, from_group='preprocessed_data'):
+        '''
+        Set up the group storing waveforms aligned by first breakfor the dataset.
+        
+        Parameters
+        ----------
+        from_group : str
+            The name of the group from which to read the waveforms to align.
+        '''
+        if len(self.parameters['waveform_labels'])<2: print('Only one waveform. No need to align peaks'); return
+        if self.parameters['collectionDirection']['value'] != 'both': print('Collection mode is one direction. No need to align peaks'); return
+        
+        with self.open_h5() as h5:
+            self.get_check_group(h5, from_group)
+    
+            rollbacks = self._calculate_rollback(h5[from_group]['hilbert'][:])
+            max_ = rollbacks.max()
+            grp = h5.require_group('first_break_aligned')
+            
+            new_shape = self.shape[:-1] + (self.shape[-1]-max_,)
+            dset = grp.require_dataset('waveforms', shape=new_shape, dtype='f4', track_order=True)
+            grp.require_dataset('hilbert', shape=new_shape, dtype='f4', track_order=True)
+            
+            dset.attrs['from_group'] = str(h5[from_group])
+            dset.attrs['rollbacks'] = rollbacks
+            dset.attrs['time_array'] = self.parameters['time_array'][:-max_]
+  
+    def fill_first_break_aligned_data(self, idxs: Iterator[tuple], from_group='preprocessed_data') -> None:
+        """Align the first break of the waveforms in the dataset and write to new dataset
+
+        Parameters
+        ----------
+        idxs : Iterator[tuple]
+            An iterator of tuples containing indices to span all but first and last axis.
+        from_group : str
+            The name of the group from which to read the waveforms to align.
+        """          
+        with self.open_h5() as h5:
+            waveform_dset_unrolled, hilbert_dset_unrolled = self.get_check_group(h5, from_group)
+            waveform_dset, hilbert_dset = self.get_check_group(h5, 'first_break_aligned')
+            new_shape = hilbert_dset.shape
+            rollbacks = waveform_dset.attrs['rollbacks']
+
+            for idx in tqdm(idxs, desc="Aligning first break", total=math.prod(self.shape[1:-1])):
+                waveform_dset[*idx] = waveform_dset_unrolled[*idx,rollbacks[idx[0]]:new_shape[-1]+rollbacks[idx[0]]]
+                hilbert_dset[*idx] = hilbert_dset_unrolled[*idx,rollbacks[idx[0]]:new_shape[-1]+rollbacks[idx[0]]]
+
+    
+
+
+# Naming convention: Acoustic__Database is a subclass of AcousticDatabase that handles __ data.
+class AcousticScanDatabase(AcousticDatabase):
     """Acoustics database subclass for 2D scan experiments (collection_index <-> X,Z coordinates).
     """
-    def __init__(self, db_path: str):
-        super().__init__(db_path)
-        self.X_, self.Z_ = self.get_grid_shape()
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        
+    # -------------------------------------------------------------------------
+    # setup and indexing functions
+    # -------------------------------------------------------------------------
+    
+    def setup_parameters(self):
+        """Setup the parameters for the acoustic data."""
+        self.parameters = self.get_sqlite_parameters()
+        self.parameters['shape'] = (
+            len(self.parameters["waveform_labels"]),
+            math.ceil(self.parameters["primaryAxisRange"]['value'] / abs(self.parameters["primaryAxisStep"]['value'])) + 1,
+            math.ceil(self.parameters["secondaryAxisRange"]['value'] / abs(self.parameters["secondaryAxisStep"]['value'])) + 1,
+            len(self.parameters["time_array"]))
+        self.parameters['len'] = self.parameters['shape'][1]*self.parameters['shape'][2]
+        
+        self.shape = self.parameters['shape']
+        self.len = self.parameters['len']
+        
+        self.save_parameters()
 
-    def clear_grid_cache(self) -> None:
-        """Clear cached grid arrays for waveform and analysis results."""
-        self._fetch_waveform_grid_cached.cache_clear()
-        self._fetch_analysis_grid_cached.cache_clear()
-        self._fetch_hilbert_grid_cached.cache_clear()
+    def sqlite_to_h5(self): # TODO: test
+        """Convert the SQLite database to an HDF5 file."""
+        self.setup_parameters()
+        
+        keys = ['collection_idx', 'time_collected']
+        values = (self.sqlite_database.fetch_column(column) for column in ('collection_index', 'time_collected'))
+        shapes = [self.shape[1:3], self.shape[1:3]]
+        # TODO: add cases for if there is offset, gain and autorange
+        
+        self.setup_raw_dataset()
+        self.fill_raw_dataset(self.idx_sqlite_data_generator())
+        
+        self.write_indexed_parameter(keys, values, shapes)
+        
+        print(f'\tFinished')
+
+    def idx_sqlite_data_generator(self):
+        for w,waveform in enumerate(self.parameters['waveform_labels']):
+            for x in range(self.shape[1]):
+                for z in range(self.shape[2]):
+                    yield (w,x,z), self.sqlite_database.fetch_waveform(waveform, x+z*self.shape[1])
+
+    def w_x_z_generator(self):
+        for w in range(len(self.parameters['waveform_labels'])):
+            for x in range(self.shape[1]):
+                for z in range(self.shape[2]):
+                    yield (w,x,z)
+
+    def x_z_generator(self):
+        for x in range(self.shape[1]):
+            for z in range(self.shape[2]):
+                yield (x,z)
 
     # -------------------------------------------------------------------------
-    # collection indexing
+    # preprocessing
     # -------------------------------------------------------------------------
-
-    def get_axis_names(self) -> tuple[str, str]:
-        """Get the primary and secondary axis column names.
-
-        Returnsk
-        -------
-        tuple[str, str]
-            The primary and secondary axis names.
-        """
-        return self.parameters["primaryAxis"], self.parameters["secondaryAxis"]
-
-    def get_grid_shape(self) -> tuple[int, int]:
-        """Get the scan grid shape.
-
-        Returns
-        -------
-        tuple[int, int]
-            (n_secondary, n_primary) step counts.
-        """
-        n_primary = math.ceil(self.parameters["primaryAxisRange"] / abs(self.parameters["primaryAxisStep"])) + 1
-        n_secondary = math.ceil(self.parameters["secondaryAxisRange"] / abs(self.parameters["secondaryAxisStep"])) + 1
-        return  n_primary, n_secondary
-
-    def fetch_collection_index(self, x: float, z: float, ) -> int:
-        return x + -z*self.X_ 
-
-    def fetch_time_index(self, t: float) -> tuple[float, int]:
-        """Fetch the time index corresponding to a given time value.
+    
+    def write_preprocessed_data(self, **kwargs): # TODO: implement shift/crop waveform based on first arrival time
+        '''Write preprocessed data to the HDF5 file.
 
         Parameters
         ----------
-        t : float
-            The time value.
-
-        Returns
-        -------
-        tuple[float, int]
-            The nearest stored time value and its index.
-        """
-        time_zero = self.parameters["measureDelay"] * 1e3
-        time_step = self.parameters["dt"] * 1e9
-        idx = int(round((t - time_zero) / time_step))
-        return time_zero + idx * time_step, idx
+        **kwargs
+            Parameters passed to :meth:`setup_preprocessed_data`. See that
+            method for the available preprocessing options.
+        '''
+        self.setup_preprocessed_data(**kwargs)
+        self.fill_preprocessed_data(self.w_x_z_generator() )
+        print('\tFinished')
     
     # -------------------------------------------------------------------------
-    # acoustics
+    # alignment
     # -------------------------------------------------------------------------
-    def fetch_raw_image(self, waveform: str) -> np.ndarray:
-        """Fetch a column's values reshaped into the scan's 2D grid.
+        
+    def write_first_break_aligned_data(self, **kwargs): 
+        """Align the first break of the waveforms in the dataset and write to the HDF5 file.
 
         Parameters
         ----------
-        waveform : str
-            The name of the waveform.
-
-        Returns
-        -------
-        np.ndarray
-            Array of shape (n_secondary, n_primary).
+        **kwargs
+            Parameters passed to :meth:`setup_first_break`. See that
+            method for the available alignment options.
         """
-        values = self.fetch_column(waveform, self.acoustics_table)
-        return np.asarray(values).reshape(self.Z_, self.X_)
-
-    @lru_cache(maxsize=32)
-    def _fetch_waveform_grid_cached(self, waveform: str) -> np.ndarray:
-        """Cached waveform grid result."""
-        if not self.has_waveform(waveform):
-            raise ValueError(f"Unknown waveform: {waveform}")
-
-        blobs = self.fetch_column(waveform, self.acoustics_table)
-        waveforms = np.stack([self.deserialize_array(b) for b in blobs])
-        return waveforms.reshape(self.Z_,self.X_,-1)
-
-    def fetch_waveform_grid(self, waveform: str) -> np.ndarray:
-        """Fetch a waveform column reshaped into the scan's 2D grid.
-
-        Parameters
-        ----------
-        waveform : str
-            The name of the waveform column.
-
-        Returns
-        -------
-        np.ndarray
-            Array of shape (n_secondary, n_primary, n_samples).
-        """
-        return self._fetch_waveform_grid_cached(waveform)
-
-    def fetch_raw_image(self, waveform, t_idx):
-        return self.fetch_waveform_grid(waveform)[:, :, t_idx]
-
-    def fetch_raw_waveform(self, waveform, x_idx, z_idx):
-        return self.fetch_waveform_grid(waveform)[z_idx, x_idx, :]
+        self.setup_first_break_aligned_data(**kwargs)
+        self.fill_first_break_aligned_data(self.w_x_z_generator(), **kwargs)
+        print('\tFinished')
     
     # -------------------------------------------------------------------------
-    # analysis
+    # basic viz
     # -------------------------------------------------------------------------
 
-    @lru_cache(maxsize=32)
-    def _fetch_analysis_grid_cached(self, waveform: str, analysis_name: str, result_name: str, reference_id: int | None) -> np.ndarray:
-        """Cached analysis grid result.
-        """
-        query = f"""
-            SELECT collection_index, value FROM {self._quote(self.analysis_table)}
-            WHERE waveform=? AND analysis_name=? AND result_name=?
-        """
-        params = [waveform, analysis_name, result_name]
+    def view_mean_img_plot(self, from_group = 'preprocessed_data'): #TODO: check
+        fig, ax = plt.subplots(1+self.shape[0], 1)
+        ax = ax.flatten()
+        with self.open_h5() as h5:
+            data = h5[from_group]['waveforms']
+            for i, dat in enumerate(data):
+                a = ax[i].imshow(abs(dat).max(axis=(2)).T,)
+                plt.colorbar(a, ax=ax[i], label='Ampl. (mV)')
+                ax[i].set_title(self.parameters['waveform_labels'][i])
+                ax[-1].plot(data.attrs['time_array'], dat.mean(axis=(0,1)), label=self.parameters['waveform_labels'][i])
+            ax[-1].legend()
+        fig.suptitle('pixel wise abs. max. of image and spectrum of processed data')
+        fig.tight_layout()
+        fig.show()
 
-        if reference_id is not None:
-            query += " AND reference_id=?"
-            params.append(reference_id)
 
-        query += " ORDER BY collection_index"
-        rows = self.connection.execute(query, params).fetchall()
-
-        expected = self.Z_ * self.X_
-        if len(rows) != expected: raise ValueError(f"Expected {expected} results for grid, found {len(rows)}")
-
-        values = [
-            self.deserialize_array(v) if isinstance(v, (bytes, bytearray, memoryview)) else v
-            for _, v in rows
-        ]
-
-        if isinstance(values[0], np.ndarray):
-            return np.stack(values).reshape(self.Z_, self.X_, -1)
-        return np.asarray(values).reshape(self.Z_, self.X_)
-
-    def fetch_analysis_grid(self, waveform: str, analysis_name: str, result_name: str, reference_id: int | None = None) -> np.ndarray:
-        """Fetch an analysis result reshaped into the scan's 2D grid.
-
-        Parameters
-        ----------
-        waveform : str
-            The waveform name.
-        analysis_name : str
-            The name of the analysis.
-        result_name : str
-            The name of the result.
-        reference_id : int | None, optional
-            The reference ID, by default None.
-
-        Returns
-        -------
-        np.ndarray
-            Array of shape (n_secondary, n_primary) for scalar results, or
-            (n_secondary, n_primary, n_samples) for array results.
-        """
-        return self._fetch_analysis_grid_cached(waveform, analysis_name, result_name, reference_id)
-
-    @lru_cache(maxsize=32)
-    def _fetch_hilbert_grid_cached(self, waveform: str, reference_id: int) -> np.ndarray:
-        """Return the cached magnitude Hilbert transform of a processed grid."""
-        processed_grid = self.fetch_analysis_grid(
-            waveform,
-            "preprocessed",
-            "waveform",
-            reference_id,
-        )
-        return np.abs(hilbert(processed_grid, axis=-1))
-
-    def fetch_hilbert_grid(self, waveform: str, reference_id: int) -> np.ndarray:
-        """Return a cached Hilbert-envelope grid for processed waveform data."""
-        return self._fetch_hilbert_grid_cached(waveform, reference_id)
-
-    def fetch_latest_analysis_reference(
-        self,
-        waveform: str,
-        analysis_name: str,
-        result_name: str,
-    ) -> int:
-        """Return the newest analysis reference for a waveform and result."""
-        row = self.connection.execute(
-            f"""
-            SELECT reference_id
-            FROM {self._quote(self.analysis_table)}
-            WHERE waveform=? AND analysis_name=? AND result_name=?
-            ORDER BY rowid DESC
-            LIMIT 1
-            """,
-            (waveform, analysis_name, result_name),
-        ).fetchone()
-        if row is None:
-            raise ValueError(
-                f"No {analysis_name}/{result_name} data is available for {waveform}"
-            )
-        return int(row[0])
-  
       
-    
-# needs testing
-class AcousticsSweepDatabase(AcousticsDatabase):
+# TODO
+class AcousticsSweepDatabase(AcousticDatabase):
     """Acoustics database subclass for sweep experiments (collection_index <-> single swept parameter)."""
 
     # -------------------------------------------------------------------------
@@ -1593,59 +1142,19 @@ class AcousticsSweepDatabase(AcousticsDatabase):
 
 
 # TODO: build out and integrate with visualization classes    
-class AcousticsDatabaseFrequencyDomain(AcousticsDatabase):
-    """A class for handling frequency domain data in an acoustics database.
-
-    This class extends the AcousticsDatabase class to provide additional functionality
-    for working with frequency domain data, such as FFT results.
-    """
-
-    def __init__(self, database_path: str):
-        """Initialize the AcousticsDatabaseFrequencyDomain instance.
-
-        Parameters
-        ----------
-        database_path : str
-            The path to the SQLite database file.
-        """
-        super().__init__(database_path)
-        
-        
-        
-        
-class AcousticsDatabaseCWT(AcousticsDatabaseFrequencyDomain):
+class AcousticScanFrequencyDomainDatabase(AcousticDatabase):
+    """A class for handling frequency domain data in an acoustics database."""
+     
+class AcousticDatabaseCWT(AcousticDatabaseFrequencyDomain):
     """A class for handling continuous wavelet transform data in an acoustics database.
 
     This class extends the AcousticsDatabaseFrequencyDomain class to provide additional functionality
     for working with continuous wavelet transform data.
     """
 
-    def __init__(self, database_path: str):
-        """Initialize the AcousticsDatabaseCWT instance.
-
-        Parameters
-        ----------
-        database_path : str
-            The path to the SQLite database file.
-        """
-        super().__init__(database_path)
-        
-        
-
-class AcousticsDatabaseTMM(AcousticsDatabaseFrequencyDomain):
+class AcousticDatabaseTMM(AcousticDatabaseFrequencyDomain):
     """A class for handling time-frequency map data in an acoustics database.
 
     This class extends the AcousticsDatabase class to provide additional functionality
     for working with time-frequency map data.
     """
-
-    def __init__(self, database_path: str):
-        """Initialize the AcousticsDatabaseTMM instance.
-
-        Parameters
-        ----------
-        database_path : str
-            The path to the SQLite database file.
-        """
-        super().__init__(database_path)
-        
