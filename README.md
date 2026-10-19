@@ -13,6 +13,14 @@ Install requirements:
 pip install -r requirements.txt
 ```
 
+Before attempting to import ultrasonic_ml packages in python, add to paths:
+```python
+import sys
+sys.path.append('<path_to_repo>/ultrasonic_ml/src/')
+
+from ultrasonic_ml.viz import ...
+```
+
 You can follow along with examples in the Notebooks folder
 
 ## Repository Structure:
