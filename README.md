@@ -2,6 +2,19 @@
 
 gathering code and notebooks for ultrasonic analysis
 
+## Installation
+In command line:
+```
+git clone -b hdf5_format https://github.com/changbatterygroup/ultrasonic_ml.git
+```
+
+Install requirements:
+```
+pip install -r requirements.txt
+```
+
+You can follow along with examples in the Notebooks folder
+
 ## Repository Structure:
 
 ```
