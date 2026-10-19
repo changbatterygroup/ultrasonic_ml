@@ -8,3 +8,4 @@ param
 panel
 holoviews
 bokeh
+moviepy
