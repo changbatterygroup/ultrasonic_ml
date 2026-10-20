@@ -66,9 +66,11 @@ $$
 The full stack is constructed as:
 
 $$
-\begin{bmatrix} \psi_{i,r} \\ \psi_{i,l} \end{bmatrix}
+\begin{bmatrix} \psi_{i,r} \\ 
+\psi_{i,l} \end{bmatrix}
 = P_{M_0} D_{M_0,M_1} P_{M_1} D_{M_1,M_2} P_{M_2} D_{M_2,M_3} P_{M_3} D_{M_3,M_4} P_{M_4}
-\begin{bmatrix} \psi_{f,r} \\ \psi_{f,l} \end{bmatrix}
+\begin{bmatrix} \psi_{f,r} \\ 
+\psi_{f,l} \end{bmatrix}
 $$
 
 **Boundary conditions:**
@@ -87,9 +89,12 @@ $$
 $$
 
 $$
-\begin{bmatrix} \psi_{i,r} \\ \psi_{i,l} \end{bmatrix} =
-\begin{bmatrix} T_{11} & T_{12} \\ T_{21} & T_{22} \end{bmatrix}
-\begin{bmatrix} \psi_{f,r} \\ \psi_{f,l} \end{bmatrix}
+\begin{bmatrix} \psi_{i,r} \\ 
+\psi_{i,l} \end{bmatrix} =
+\begin{bmatrix} T_{11} & T_{12} \\ 
+T_{21} & T_{22} \end{bmatrix}
+\begin{bmatrix} \psi_{f,r} \\ 
+\psi_{f,l} \end{bmatrix}
 $$
 
 $(\psi_{f,r}, \psi_{f,l})$ are the final right- and left-moving waveforms, and $(\psi_{i,r}, \psi_{i,l})$ are the initial ones.
@@ -346,8 +351,10 @@ $$
 TODO (not in the paper, verify): reflection off the back wall (between materials $M_2$ and $M_3$) can be written as:
 
 $$
-\begin{bmatrix} \psi_{i,r} \\ \psi_{i,l} \end{bmatrix}
+\begin{bmatrix} \psi_{i,r} \\ 
+\psi_{i,l} \end{bmatrix}
 = P_{M_0} D_{M_0,M_1} P_{M_1} D_{M_1,M_2} P_{M_2} D_{M_2,M_3} P_{M_3} D_{M_3,M_4}
 P_{M_3} D_{M_3,M_2} P_{M_2} D_{M_2,M_1} P_{M_1} D_{M_1,M_0} P_{M_0}
-\begin{bmatrix} \psi_{f,r} \\ \psi_{f,l} \end{bmatrix}
+\begin{bmatrix} \psi_{f,r} \\ 
+\psi_{f,l} \end{bmatrix}
 $$
