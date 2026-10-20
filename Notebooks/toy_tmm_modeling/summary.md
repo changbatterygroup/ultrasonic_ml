@@ -119,9 +119,9 @@ If your input signal contains multiple frequencies (such as our Morlet), you nee
 
 1. Take the FFT of the Morlet input.
 2. Calculate the transfer matrix $T$ at every frequency. If this is too expensive, we can threshold which bins to use.
-3. Calculate $(\psi_{f,r}, \psi_{i,l})$ in the frequency domain and apply the IFFT to get back to the time domain.
+3. Calculate $`(\psi_{f,r}, \psi_{i,l})`$ in the frequency domain and apply the IFFT to get back to the time domain.
 
-When using the FFT, there will be signal at both $\pm f$. Then $T(-f) = T(f)^*$, because $P_{M_n}(-f) = P_{M_n}(f)^*$ and $D_{M_n,M_m}$ is not frequency dependent.
+When using the FFT, there will be signal at both $\pm f$. Then $`T(-f) = T(f)^*`$, because $`P_{M_n}(-f) = P_{M_n}(f)^*`$ and $`D_{M_n,M_m}`$ is not frequency dependent.
 
 ## Discretizing the time signal: padding and phase shift to center the signal
 
