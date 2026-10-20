@@ -108,8 +108,7 @@ from ultrasonic_ml.viz import ...
 2. 2nd level indent for columns
 
 * original waveform is referenced with collection_index
-* analysis waveforms are recognized with any combination of PRIMARY KEY (collection_index,waveform,analysis_name,result_name,reference_id)
-
+  
 ```text
 DATABASE.sqlite3
 |
