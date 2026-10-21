@@ -878,84 +878,183 @@ class AcousticDatabase:
         fig.show()
   
 
-# Naming convention: AcousticDatabase__ is a subclass of AcousticDatabase that handles __ analysis.   
+# Naming convention: AcousticDatabase<AnalysisType>  
+# -- Does not have full functionality, but contains scaffold for interacting with the H5 File and performing analysis
 class AcousticDatabaseFFT(AcousticDatabase):
-    def __init__(self, **kwargs):
+    '''Acoustics database subclass for performing FFT analysis on the dataset. The FFT is computed along the last axis of the dataset.
+    Assuming real input, the negative frequencies are mirrored and can be ignored. 
+    When transforming back to time domain, mirror around 0 frequency and perform inverse FFT.
+    '''
+    def __init__(self, window=np.hanning, **kwargs):
         super().__init__(**kwargs)
-        
+        self.window = window
     # -------------------------------------------------------------------------
-    # alignment
+    # Frequency Domain
     # -------------------------------------------------------------------------
     
     @staticmethod
-    def _calculate_rollback(waveform):
-        '''
-        Calculate the average rollback value fo each of the mean waveforms
-        
-        Parameters:
-        -----------
-        waveform: np.ndarray
-            The waveform data.
-            
-        Returns:
-        --------
-        np.ndarray
-            The mean rollback values for each waveform profile.
-        '''
-        mean_profile = waveform.mean(axis=tuple(i for i in range(1,len(waveform.shape)-1)))
-        peak_distances = np.array([ find_peaks(profile, height=0.25*profile.max())[0][0] for profile in mean_profile ])
-        rollback = peak_distances-min(peak_distances)
-        return rollback
+    def _fft(waveform): 
+        '''O(B · N log N)'''
+        return np.fft.rfft(waveform) 
     
-    def setup_first_break_aligned_data(self, from_group='preprocessed_data'):
+    @staticmethod
+    def _abs(fft_): 
+        '''O(B · M)'''
+        return np.abs(fft_) # O(B · M)
+
+    @staticmethod
+    def _angle(fft_): 
+        '''O(B · M)'''
+        return np.angle(fft_)
+
+    def _phase_delay(self, phase_, freq): 
+        '''O(B · M)'''
+        return phase_ / freq
+
+    def _group_delay(self, phase_, freq): 
+        '''O(B · M)
+        Parameters
+        ----------
+        phase_ : np.ndarray
+            The phase of the FFT in (radians).
+        freq : np.ndarray
+            The frequencies corresponding to the FFT.
+            
+        Returns
+        -------
+        np.ndarray
+            The group delay, in units of 1/(frequency units).
         '''
-        Set up the group storing waveforms aligned by first breakfor the dataset.
-        
+        return -np.gradient(np.unwrap(phase_, axis=-1,), 2*np.pi*freq, axis=-1)
+    
+    def _ifft(self, fft_): return np.fft.irfft(fft_)
+    
+    def setup_fft_data(self, from_group='preprocessed_data'):
+        '''
+        Set up the group and dataset storing waveforms in the frequency domain for the dataset.
+
         Parameters
         ----------
         from_group : str
-            The name of the group from which to read the waveforms to align.
+            The name of the group from which to read the waveforms to transform.
         '''
-        if len(self.parameters['waveform_labels'])<2: print('Only one waveform. No need to align peaks'); return
-        if self.parameters['collectionDirection']['value'] != 'both': print('Collection mode is one direction. No need to align peaks'); return
-        
         with self.open_h5() as h5:
-            self.get_check_group(h5, from_group)
-    
-            rollbacks = self._calculate_rollback(h5[from_group]['hilbert'][:])
-            max_ = rollbacks.max()
-            grp = h5.require_group('first_break_aligned')
+            from_waveform, _ = self.get_check_group(h5, from_group)
+            fft_group = h5.require_group('fft_data')
             
-            new_shape = self.shape[:-1] + (self.shape[-1]-max_,)
-            dset = grp.require_dataset('waveforms', shape=new_shape, dtype='f4', track_order=True)
-            grp.require_dataset('hilbert', shape=new_shape, dtype='f4', track_order=True)
+            dset = fft_group.require_dataset('calculations', shape=from_waveform.shape[:-1] + (from_waveform.shape[-1]//2+1,), dtype='c8', track_order=True)
             
-            dset.attrs['from_group'] = str(h5[from_group])
-            dset.attrs['rollbacks'] = rollbacks
-            dset.attrs['time_array'] = self.parameters['time_array'][:-max_]
-  
-    def fill_first_break_aligned_data(self, idxs: Iterator[tuple], from_group='preprocessed_data') -> None:
-        """Align the first break of the waveforms in the dataset and write to new dataset
+            dset.attrs['from_group'] = str(from_waveform)
+            dset.attrs['frequencies'] = np.fft.rfftfreq(from_waveform.shape[-1], d=self.parameters['dt']['value'])
+            dset.attrs['window'] = self.window.__name__ if self.window is not None else None
+            
+    def fill_fft_data(self, idxs: Iterator[tuple], from_group='preprocessed_data') -> None:
+        '''
+        Set up the group storing waveforms in the frequency domain for the dataset.
 
         Parameters
         ----------
         idxs : Iterator[tuple]
             An iterator of tuples containing indices to span all but first and last axis.
         from_group : str
-            The name of the group from which to read the waveforms to align.
-        """          
+            The name of the group from which to read the waveforms to transform.
+        '''
         with self.open_h5() as h5:
-            waveform_dset_unrolled, hilbert_dset_unrolled = self.get_check_group(h5, from_group)
-            waveform_dset, hilbert_dset = self.get_check_group(h5, 'first_break_aligned')
-            new_shape = hilbert_dset.shape
-            rollbacks = waveform_dset.attrs['rollbacks']
+            from_waveform, _ = self.get_check_group(h5, from_group)
+            fft_grp = h5['fft_data']
+            fft_dset = fft_grp['calculations']
 
-            for idx in tqdm(idxs, desc="Aligning first break", total=math.prod(self.shape[1:-1])):
-                waveform_dset[*idx] = waveform_dset_unrolled[*idx,rollbacks[idx[0]]:new_shape[-1]+rollbacks[idx[0]]]
-                hilbert_dset[*idx] = hilbert_dset_unrolled[*idx,rollbacks[idx[0]]:new_shape[-1]+rollbacks[idx[0]]]
+            for idx in tqdm(idxs, desc="Computing FFT", total=math.prod(self.shape[1:-1])):
+                if self.window is not None:
+                    from_waveform[*idx] = self.window(from_waveform.shape[-1])*from_waveform[*idx]
+                fft_dset[*idx] = self._fft(from_waveform[*idx])
 
-    
-# Naming convention: Acoustic__Database is a subclass of AcousticDatabase that handles __ data.
+    def get_fft_data(self, idx, h5):
+        '''Get the values as the full spectrum, not just real portion
+        
+        Parameters
+        ----------
+        idx : tuple
+            The index of the FFT data to retrieve.
+
+        Returns
+        -------
+        np.ndarray
+            The FFT data for the given index.
+        '''
+        try: 
+            return np.stack( [ h5['fft_data']['calculations'][*idx][...,::-1], h5['fft_data']['calculations'][*idx]] )
+        except KeyError as e: 
+            print(e, 'Run setup_fft_data first'); return None
+            
+    def get_fft_frequencies(self, idx, h5):
+        '''Get the values as the full spectrum, not just real portion
+        
+        Parameters
+        ----------
+        idx : tuple
+            The index of the FFT data to retrieve.
+
+        Returns
+        -------
+        np.ndarray
+            The FFT data for the given index.
+        '''
+        try: 
+            return np.stack( [ h5['fft_data']['calculations'].attrs['frequencies'][...,::-1], h5['fft_data']['calculations'][*idx].attrs['frequencies'] ] )
+        except KeyError as e: 
+            print(e, 'Run setup_fft_data first'); return None
+
+    # -------------------------------------------------------------------------
+    # basic viz
+    # -------------------------------------------------------------------------
+
+    def view_fft_plots(self, idx, crop=None, from_group='preprocessed'): #TODO: check
+        plt.clf()
+        fig, ax = plt.subplots(2, 2, figsize=(8, 6))
+        ax = ax.flatten()
+        
+        with self.open_h5() as h5:
+            if crop is None: crop = [0, len(h5[from_group]['waveforms'][0])]
+            data = h5[from_group]['waveforms'][:,*idx]
+            time_array = h5[from_group]['waveforms'].attrs['time_array']
+
+            fft_data = h5['fft_data']['calculations'][:,*idx]
+            freq = h5['fft_data']['calculations'].attrs['frequencies']/1e6
+            
+            for i, dat in enumerate(fft_data):
+                
+                magnitude = self._abs(dat)/len(dat)*2
+                phase = self._angle(dat)
+                group_delay = self._group_delay(phase, freq)
+                
+                ax[0].plot(time_array/1e3, data[i])
+                ax[0].set_title('Original Waveform')
+                ax[0].set_xlabel('Time (us)')
+                ax[0].set_ylabel('Magnitude (mV)') 
+                               
+                ax[1].plot(freq[crop[0]:crop[1]], magnitude[crop[0]:crop[1]], label=self.parameters['waveform_labels'][i])
+                ax[1].set_title('Magnitude')
+                ax[1].set_ylabel('Magnitude (normalized)')
+                
+                ax[2].plot(freq[crop[0]:crop[1]], phase[crop[0]:crop[1]])
+                ax[2].set_title('Phase')
+                ax[2].set_ylabel('Phase (rad)')
+                
+                ax[3].plot(freq[crop[0]:crop[1]], group_delay[crop[0]:crop[1]])
+                ax[3].set_title('Group Delay')
+                ax[3].set_ylabel('Group Delay (us)')
+            
+            [a.set_xlabel('Frequency (MHz)') for a in ax[1:]]
+            ax[1].legend()
+                
+        fig.tight_layout()
+        plt.show()
+
+
+# Naming convention:  Acoustic<ExperimentType>Database 
+# -- Specific to the type of experiment and how the data is collected. They define how to index the data and how to convert from SQLite to HDF5.
+# -- Have full functionality and can be used to store analysis results in the HDF5 file.
 class AcousticScanDatabase(AcousticDatabase):
     """Acoustics database subclass for 2D scan experiments (collection_index <-> X,Z coordinates).
     """
@@ -1061,6 +1160,29 @@ class AcousticScanDatabase(AcousticDatabase):
         fig.suptitle('pixel wise abs. max. of image and spectrum of processed data')
         fig.tight_layout()
         fig.show()
+
+
+class AcousticScanDatabaseFFT(AcousticDatabaseFFT, AcousticScanDatabase):
+    """Acoustics database subclass for 2D scan experiments (collection_index <-> X,Z coordinates) with FFT preprocessing."""
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        
+    # -------------------------------------------------------------------------
+    # FFT
+    # -------------------------------------------------------------------------
+    
+    def write_fft_data(self, **kwargs): # TODO: implement shift/crop waveform based on first arrival time
+        '''Write preprocessed data to the HDF5 file.
+
+        Parameters
+        ----------
+        **kwargs
+            Parameters passed to :meth:`setup_preprocessed_data`. See that
+            method for the available preprocessing options.
+        '''
+        self.setup_fft_data(**kwargs)
+        self.fill_fft_data(self.w_x_z_generator(), **kwargs )
+        print('\tFinished')
 
 
       
