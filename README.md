@@ -2,6 +2,27 @@
 
 gathering code and notebooks for ultrasonic analysis
 
+## Installation
+In command line:
+```
+git clone -b hdf5_format https://github.com/changbatterygroup/ultrasonic_ml.git
+```
+
+Install requirements:
+```
+pip install -r requirements.txt
+```
+
+Before attempting to import ultrasonic_ml packages in python, add to paths:
+```python
+import sys
+sys.path.append('<path_to_repo>/ultrasonic_ml/src/')
+
+from ultrasonic_ml.viz import ...
+```
+
+You can follow along with examples in the Notebooks folder
+
 ## Repository Structure:
 
 ```
@@ -87,8 +108,7 @@ from ultrasonic_ml.viz import ...
 2. 2nd level indent for columns
 
 * original waveform is referenced with collection_index
-* analysis waveforms are recognized with any combination of PRIMARY KEY (collection_index,waveform,analysis_name,result_name,reference_id)
-
+  
 ```text
 DATABASE.sqlite3
 |
