@@ -11,6 +11,7 @@ __pycache__/
 # ignore data files
 *.sqlite3
 *.pickle
+*.h5
 
 # ignore sphinx build files
 docs/build/
@@ -22,3 +23,6 @@ docs/source/_templates
 */.env
 Notebooks/.env
 Notebooks/.DS_Store
+
+*.gif
+*/*.gif

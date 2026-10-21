@@ -1,568 +1,263 @@
-from __future__ import annotations
-
+import h5py
 import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.widgets import Slider
+import holoviews as hv
+import panel as pn
+
+import param
+from holoviews import streams
+from functools import lru_cache
+
+from bokeh.models import CustomJSTickFormatter
+
+# Initialize HoloViews with Bokeh backend
+hv.extension('bokeh')
 
 
-class AcousticsViewer:
-    """Base viewer for raw and analyzed waveforms on a single axes."""
+def launch_visualizer(class_, **kwargs):
+    """
+    Launches the interactive dashboard for visualizing acoustic scan data.
+    
+    Parameters:
+    -----------
+    class_ : AcousticViewer class
+        The class to instantiate for the visualizer.
+    **kwargs : dict
+        Additional keyword arguments to pass to the visualizer. May include:
+        - database : AcousticDatabase class
+        - from_group : str, optional
+    """
+    with class_(**kwargs) as visualizer:
+        app = visualizer.create_dashboard()
+        server = pn.serve(app, show=True, threaded=True)
+        input("Use the viewer, then press Enter here to close it...")
+        server.stop()
+        
+        
+class AcousticScanViewer(param.Parameterized):
+    current_x = param.Integer(default=0)
+    current_z = param.Integer(default=0)
+    current_y = param.Integer(default=0)
 
-    def __init__(self, db, waveforms=None, analyses=None, *, x_unit="ns", y_unit="V", figsize=(10, 5)):
+    # -------------------------------------------------------------------------
+    # Magic Methods
+    # -------------------------------------------------------------------------
+
+    def __init__(self, db, from_group='preprocessed_data', **params):
+        """
+        Parameters:
+        -----------
+        db : AcousticDatabase class
+        """
+        super().__init__()
         self.db = db
-        self.waveforms = waveforms or db.waveform_columns
-        self.analyses = analyses or []
-        self.x_unit = x_unit
-        self.y_unit = y_unit
-        self.figsize = figsize
+        self.labels = db.parameters['waveform_labels']
+        self.from_group = from_group
+        self.aspect_ratio = 10#
+        self._spatial_tap_streams = {}#
+        self._waveform_tap_stream = None#
+        
+        self._is_open = False
+        
+        # Reactive global states for tracking crosshairs/slices without static sliders
+        self.current_x = db.shape[1] // 2
+        self.current_z = db.shape[2] // 2
+        self.current_y = db.shape[3] // 2
+        
+        self.open_reader()
 
-        self.n = db.get_acquisition_count()
-        self.row = 0
+    def __enter__(self) -> AcousticScanViewer:
+        self.open_reader()
+        return self
 
-        self.time = np.asarray(db.fetch_time(0))
-        self.x_limits = (float(self.time.min()), float(self.time.max()))
+    def __exit__(self):
+        self.close()
 
-        self.absolute_max = {
-            waveform: self._get_maximum(waveform)
-            for waveform in self.waveforms
-        }
+    # -------------------------------------------------------------------------
+    # Database management
+    # -------------------------------------------------------------------------
 
-        self.fig = None
-        self.ax = None
-        self.slider = None
-        self.raw_lines = {}
-        self.analysis_lines = {}
+    def open_reader(self):
+        """Opens H5 file read-only and automatically builds dynamic indices."""
+        if not self._is_open:
+            self.h5 = h5py.File(self.db.h5_name, 'r')
+            self.acoustic_ds = self.h5[f"/{self.from_group}/waveforms"] # open datasets
+            self.hilbert_ds = self.h5[f"/{self.from_group}/hilbert"]
+            self.time = self.acoustic_ds.attrs['time_array'] # get time
+            self.shape = self.acoustic_ds.shape # get shape
+            self._is_open = True
+            
+    def close(self):
+        if self._is_open and self.h5 is not None:
+            self.h5.close() # close dataset
+            self.clear_cache() # clear cache
+            self.h5 = None
+            self._is_open = False
 
-    # ------------------------------------------------------------------
-    # Data
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # Data Fetchers
+    # -------------------------------------------------------------------------
 
-    def _get_maximum(self, waveform):
-        if hasattr(self.db, "absolute_max") and waveform in self.db.absolute_max:
-            return float(self.db.absolute_max[waveform])
+    def get_2d_slice(self, w: int, y: int, dataset: str = 'hilbert') -> np.ndarray:
+        if dataset == 'hilbert': source = self.hilbert_ds
+        elif dataset == 'acoustic': source = self.acoustic_ds
+        else: raise ValueError("dataset must be 'hilbert' or 'acoustic'")
+        return source[int(w), :, :, int(y)]
 
-        maximum = 0.0
+    @lru_cache(maxsize=128)
+    def _fetch_1d_waveform(self, w: int, x: int, z: int): return self.acoustic_ds[w, x, z, :], self.hilbert_ds[w, x, z, :]
 
-        for row in range(self.n):
-            data = np.asarray(self.db.fetch_waveform(waveform, row))
-            maximum = max(maximum, float(np.max(np.abs(data))))
+    def get_1d_waveform(self, w: int, x: int, z: int) -> tuple: return self._fetch_1d_waveform(int(w), int(x), -int(z))
 
-        return maximum
+    def clear_cache(self): self._fetch_1d_waveform.cache_clear()
 
-    def fetch_waveform(self, waveform, row=None):
-        row = self.row if row is None else row
-        return np.asarray(self.db.fetch_waveform(waveform, row))
+    # -------------------------------------------------------------------------
+    # 2D SPATIAL SCAN GRID COMPONENT
+    # -------------------------------------------------------------------------
+    
+    #TODO: get rid of prints
+    def build_spatial_grid(self, direction_idx: int, dataset: str = 'hilbert'):
+        """
+        Generates a 2D spatial scan grid for a specific waveform layout plane.
+        Includes an active crosshair tracking where you click.
+        """
+        tap_stream = streams.Tap(x=self.current_x, y=self.current_z)
 
-    def fetch_analysis(self, analysis, row=None):
-        row = self.row if row is None else row
-        return np.asarray([self.db.fetch_analysis_value(row, waveform, analysis, result_name: str, reference_id: int | None = None))
-
-    def fetch_time(self, row=None):
-        row = self.row if row is None else row
-        return np.asarray(self.db.fetch_time(row))
-
-    def get_collection_index(self, row=None):
-        row = self.row if row is None else row
-        return self.db.get_acquisition_index(row)
-
-    # ------------------------------------------------------------------
-    # Figure
-    # ------------------------------------------------------------------
-
-    def build(self):
-        self.fig, self.ax = plt.subplots(figsize=self.figsize, constrained_layout=True)
-
-        self._setup_axes()
-        self._create_slider()
-        self._connect_events()
-        self.update()
-
-        # self.fig.tight_layout(rect=(0, 0.08, 1, 0.96))
-
-        return self.fig, self.ax
-
-    def _setup_axes(self):
-        self.ax.set_xlim(*self.x_limits)
-
-        maximum = max(self.absolute_max.values())
-        self.ax.set_ylim(-maximum, maximum)
-
-        self.ax.set_xlabel(f"Time ({self.x_unit})")
-        self.ax.set_ylabel(f"Amplitude ({self.y_unit})")
-        self.ax.grid(True, alpha=0.25)
-
-    # ------------------------------------------------------------------
-    # Plotting
-    # ------------------------------------------------------------------
-
-    def plot_raw(self):
-        """Plot raw waveforms."""
-        for waveform in self.waveforms:
-            data = self.fetch_waveform(waveform)
-            n = min(len(self.time), len(data))
-
-            if waveform not in self.raw_lines:
-                self.raw_lines[waveform], = self.ax.plot(
-                    self.time[:n],
-                    data[:n],
-                    lw=1,
-                    label=waveform,
-                )
-            else:
-                self.raw_lines[waveform].set_data(
-                    self.time[:n],
-                    data[:n],
-                )
-
-    def plot_analyzed(self):
-        """Plot analyzed waveforms."""
-        for analysis in self.analyses:
-            data = self.fetch_analysis(analysis)
-            n = min(len(self.time), len(data))
-
-            if analysis not in self.analysis_lines:
-                self.analysis_lines[analysis], = self.ax.plot(
-                    self.time[:n],
-                    data[:n],
-                    lw=1,
-                    label=analysis,
-                )
-            else:
-                self.analysis_lines[analysis].set_data(
-                    self.time[:n],
-                    data[:n],
-                )
-
-    def update(self):
-        self.plot_raw()
-        self.plot_analyzed()
-
-        self.ax.legend()
-
-        self.fig.suptitle(
-            f"Collection index: {self.get_collection_index()}",
-            fontsize=12,
+        def spatial_renderer(current_y, current_x, current_z, x, y):
+            # Fetch slice matrix
+            grid_data = self.get_2d_slice(direction_idx, current_y, dataset)
+            
+            # Create a HoloViews Image object for the 2D grid
+            img = hv.Image(
+                grid_data.T, 
+                kdims=['x', 'z'], 
+                vdims=['Intensity'],
+                bounds=(0, 0, self.shape[1], self.shape[2]) #(x0, y0, x1, y1) # changing has no effect
+            ).opts(
+                title=f"{self.labels[direction_idx]} {dataset.title()} Grid (Time Y={current_y})",
+                cmap='Viridis', colorbar=True, width=self.shape[1]*self.aspect_ratio, height=self.shape[2]*self.aspect_ratio,
+                tools=['tap', 'hover'],
+            )
+            
+            # Crosshair Overlay lines mapping active interaction coordinates
+            crosshair = hv.VLine(current_x).opts(color='white', line_dash='dashed', line_width=1.5) * \
+                        hv.HLine(current_z).opts(color='white', line_dash='dashed', line_width=1.5)
+            
+            return img * crosshair
+            
+        state_stream = streams.Params(
+            parameterized=self,
+            parameters=['current_y', 'current_x', 'current_z'],
+        )
+        dynamic_grid = hv.DynamicMap(
+            spatial_renderer,
+            streams=[state_stream, tap_stream],
         )
 
-        self.refresh()
+        def update_coordinates(x, y):
+            if x is not None and y is not None:
+                self.current_x = int(np.clip(x, 0, self.shape[1] - 1))
+                self.current_z = int(np.clip(y, 0, self.shape[2] - 1))
 
-    # ------------------------------------------------------------------
-    # Navigation
-    # ------------------------------------------------------------------
+        tap_stream.add_subscriber(update_coordinates)
+        self._spatial_tap_streams[direction_idx] = tap_stream
+        return dynamic_grid
 
-    def _create_slider(self):
-        slider_ax = self.fig.add_axes((0.15, 0.02, 0.7, 0.03))
+    # -------------------------------------------------------------------------
+    # 1D WAVEFORM OVERLAY VIEW
+    # -------------------------------------------------------------------------
+    
+    def build_overlay_waveform_plot(self):
+        """
+        Plots waveforms for ALL labels overlayed in a single multi-colored layout graph.
+        Includes a dynamic vertical indicator line showing the selected time step.
+        """
+        # Distinguishable color palette for tracking multiple waveform variations
+        palette = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b']
+        
+        time_formatter = CustomJSTickFormatter( 
+            args={'times': self.time.tolist()},
+            code="""
+                const i = Math.round(tick);
+                return i >= 0 && i < times.length
+                    ? `${times[i]} ns`
+                    : "";
+                """ )
+        line_tap = streams.Tap(x=self.current_y)
 
-        self.slider = Slider(
-            slider_ax,
-            "Collection",
-            0,
-            self.n - 1,
-            valinit=0,
-            valstep=1,
+        def waveform_renderer(current_x, current_z, current_y, x, y):
+            time_axis = np.arange(self.shape[3])
+            overlay_elements = []
+            
+            for w_idx in range(self.shape[0]):
+                acoustic_wave, hilbert_win = self.get_1d_waveform(w_idx, current_x, current_z)
+                color = palette[w_idx % len(palette)]
+                label_str = self.labels[w_idx]
+                
+                # Raw trace
+                curve = hv.Curve(
+                    (time_axis, acoustic_wave), kdims=['Time (Y)'], vdims=['Amplitude'], 
+                    label=f"{label_str} Acoustic"
+                ).opts(color=color, tools=['tap'], alpha=0.8)
+                
+                # Matching Hilbert trace (uses same color with a distinct dash pattern)
+                envelope = hv.Curve(
+                    (time_axis, hilbert_win), kdims=['Time (Y)'], vdims=['Amplitude'], 
+                    label=f"{label_str} Hilbert"
+                ).opts(color=color, line_dash='dotdash', alpha=0.5)
+                
+                overlay_elements.extend([curve, envelope])
+                
+            # Vertical time step tracking line
+            time_marker = hv.VLine(current_y).opts(color='red', line_width=2)
+            overlay_elements.append(time_marker)
+            
+            return hv.Overlay(overlay_elements).opts(
+                title=f"Waveform Comparison at Node (X: {current_x}, Z: {current_z})",
+                width=self.shape[1]*self.aspect_ratio, height=self.shape[2]*self.aspect_ratio, 
+                legend_position='right', show_legend=True, xformatter=time_formatter,
+
+            )
+            
+        state_stream = streams.Params(
+            parameterized=self,
+            parameters=['current_x', 'current_z', 'current_y'],
+        )
+        waveform_map = hv.DynamicMap(
+            waveform_renderer,
+            streams=[state_stream, line_tap],
         )
 
-        self.slider.on_changed(self._on_slider)
+        def update_time(x, y):
+            if x is not None: self.current_y = int(np.clip(x, 0, self.shape[3] - 1))
 
-    def _on_slider(self, value):
-        self.row = int(value)
-        self.update()
+        line_tap.add_subscriber(update_time)
+        self._waveform_tap_stream = line_tap
+        return waveform_map
 
-    def next(self):
-        self.goto(self.row + 1)
+    # -------------------------------------------------------------------------
+    # MAIN LAYOUT COMPOSER
+    # -------------------------------------------------------------------------
+    
+    def create_dashboard(self):
+        """Assembles dynamically computed items into an integrated control dashboard."""
+        # Create an individual 2D plot panel row matching each waveform array slice index
+        grid_plots = [self.build_spatial_grid(w) for w in range(self.shape[0])]
 
-    def previous(self):
-        self.goto(self.row - 1)
+        # Generate the shared, synchronized 1D timeline trace
+        waveform_plot = self.build_overlay_waveform_plot()
 
-    def goto(self, row):
-        row = int(np.clip(row, 0, self.n - 1))
-        self.slider.set_val(row)
+        # Format elements cleanly into columns & rows
+        dashboard_layout = pn.Column(
+            pn.pane.Markdown(f"## 📊 Scanned waveform visualization, ({self.shape[0]} channels)"),
+            pn.pane.Markdown("*Click an image to center the spatial crosshair. Click the line plot to select a specific time slice.*"),
+            pn.Column(
+                pn.Column(*grid_plots), # Stacks image dimensions vertically based on array count
+                pn.Card(waveform_plot, title="Synchronized Waveform Array View", margin=(0,10))
+            )
+        )
+        return dashboard_layout
 
-    # ------------------------------------------------------------------
-    # Interaction
-    # ------------------------------------------------------------------
 
-    def _connect_events(self):
-        self.fig.canvas.mpl_connect("button_press_event", self._on_click)
-        self.fig.canvas.mpl_connect("key_press_event", self._on_key)
 
-    def _on_click(self, event):
-        if event.inaxes is self.ax:
-            self.on_click(event)
 
-    def on_click(self, event):
-        pass
 
-    def _on_key(self, event):
-        if event.key in ("right", "down"):
-            self.next()
-        elif event.key in ("left", "up"):
-            self.previous()
-
-    # ------------------------------------------------------------------
-    # Display
-    # ------------------------------------------------------------------
-
-    def refresh(self):
-        if self.fig is not None:
-            self.fig.canvas.draw_idle()
-
-    def show(self):
-        if self.fig is None:
-            self.build()
-
-        plt.show()
-        
-        
-        
-        
-
-
-# from __future__ import annotations
-
-# import io
-# import sqlite3
-# from dataclasses import dataclass
-# from typing import Any
-
-# import numpy as np
-# from matplotlib import pyplot as plt
-
-
-# @dataclass
-# class _WaveformStore:
-#     collection_index: np.ndarray
-#     x_mm: np.ndarray
-#     z_mm: np.ndarray
-#     time_ns: list[np.ndarray]
-#     voltage: list[np.ndarray]
-
-
-# class AcousticsSpectralSpatialViewer:
-#     """Clickable spatial/spectral viewer for an open Loaded_Database object.
-
-#     Expected input:
-#         database = db.Loaded_Database(sqlite_file)
-#     where database.connection is an open sqlite3.Connection.
-#     """
-
-#     def __init__(
-#         self,
-#         database: Any,
-#         *,
-#         table: str = "acoustics",
-#         index_column: str = "collection_index",
-#         x_column: str = "X",
-#         z_column: str = "Z",
-#         time_column: str = "time",
-#     ) -> None:
-#         self.connection = self._resolve_connection(database)
-#         self.table = table
-#         self.index_column = index_column
-#         self.x_column = x_column
-#         self.z_column = z_column
-#         self.time_column = time_column
-#         self.voltage_columns = database.voltage_keys
-
-#         self.data = self._load_acoustics_rows()
-#         self._prepare_fft_cache()
-
-#         self._fig: plt.Figure | None = None
-#         self._ax_images: list[plt.Axes | None] = None
-#         self._ax_spectrums: list[plt.Axes | None] = None
-#         self._selected_marker = None
-#         self._freq_line = None
-
-#         self.cmap='viridis'
-        
-#         self.abs_max_voltage = max([np.max(np.abs(v)) for v in self.data.voltage])
-        
-#     @staticmethod
-#     def _resolve_connection(database: Any) -> sqlite3.Connection:
-#         if isinstance(database, sqlite3.Connection):
-#             return database
-#         connection = getattr(database, "connection", None)
-#         if isinstance(connection, sqlite3.Connection):
-#             return connection
-#         raise TypeError("database must be a Loaded_Database-like object with .connection")
-
-#     def _table_columns(self) -> list[str]:
-#         rows = self.connection.execute(f"PRAGMA table_info({self.table})").fetchall()
-#         return [row[1] for row in rows]
-
-#     @staticmethod
-#     def _to_array(value: Any) -> np.ndarray:
-#         if isinstance(value, np.ndarray):
-#             return value
-#         if isinstance(value, (bytes, bytearray, memoryview)):
-#             return np.load(io.BytesIO(value), allow_pickle=True)
-#         return np.asarray(value)
-
-#     def _load_acoustics_rows(self) -> _WaveformStore:
-#         query = f"""
-#             SELECT {self.index_column}, {self.x_column}, {self.z_column},
-#                    {self.time_column}, {self.voltage_column}
-#             FROM {self.table}
-#             ORDER BY {self.index_column}
-#         """
-#         rows = self.connection.execute(query).fetchall()
-#         if not rows:
-#             raise ValueError("No rows found in acoustics table")
-
-#         collection_index = np.array([int(r[0]) for r in rows], dtype=int)
-#         x_mm = np.array([float(r[1]) for r in rows], dtype=float)
-#         z_mm = np.array([float(r[2]) for r in rows], dtype=float)
-#         time_ns = [self._to_array(r[3]).astype(float).ravel() for r in rows]
-#         voltage = [self._to_array(r[4]).astype(float).ravel() for r in rows]
-
-#         return _WaveformStore(
-#             collection_index=collection_index,
-#             x_mm=x_mm,
-#             z_mm=z_mm,
-#             time_ns=time_ns,
-#             voltage=voltage,
-#         )
-
-#     def _prepare_fft_cache(self) -> None:
-#         wave_lengths = np.array([len(v) for v in self.data.voltage], dtype=int)
-#         time_lengths = np.array([len(t) for t in self.data.time_ns], dtype=int)
-#         n = int(min(wave_lengths.min(), time_lengths.min()))
-#         if n < 8:
-#             raise ValueError("Waveforms are too short for spectral analysis")
-
-#         # Trim to shortest length so heterogeneous rows are still usable.
-#         self._wave_matrix = np.vstack([v[:n] for v in self.data.voltage])
-#         self._time_matrix_ns = np.vstack([t[:n] for t in self.data.time_ns])
-
-#         dt_ns = float(np.median(np.diff(self._time_matrix_ns[0])))
-#         if dt_ns <= 0:
-#             raise ValueError("Invalid time axis (dt <= 0)")
-
-#         dt_s = dt_ns * 1e-9
-#         self.freq_hz = np.fft.rfftfreq(n, d=dt_s)
-#         self.spectrum_mag = np.abs(np.fft.rfft(self._wave_matrix, axis=1))
-
-#     def _nearest_row_for_position(self, x_mm: float, z_mm: float) -> int:
-#         d2 = (self.data.x_mm - x_mm) ** 2 + (self.data.z_mm - z_mm) ** 2
-#         return int(np.argmin(d2))
-
-#     def _nearest_freq_index(self, freq_hz: float) -> int:
-#         return int(np.argmin(np.abs(self.freq_hz - float(freq_hz))))
-
-#     def _grid_view(self, values: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
-#         x_unique = np.unique(self.data.x_mm)
-#         z_unique = np.unique(self.data.z_mm)
-#         if x_unique.size * z_unique.size != values.size:
-#             return None
-
-#         x_to_i = {v: i for i, v in enumerate(x_unique)}
-#         z_to_i = {v: i for i, v in enumerate(z_unique)}
-#         grid = np.full((z_unique.size, x_unique.size), np.nan)
-
-#         for x_val, z_val, v in zip(self.data.x_mm, self.data.z_mm, values):
-#             zi = z_to_i.get(z_val)
-#             xi = x_to_i.get(x_val)
-#             if zi is None or xi is None:
-#                 return None
-#             if not np.isnan(grid[zi, xi]):
-#                 return None
-#             grid[zi, xi] = v
-
-#         if np.isnan(grid).any():
-#             return None
-#         return x_unique, z_unique, grid
-
-#     def plot_image_at_frequency(
-#         self,
-#         freq_hz: float,
-#         *,
-#         ax: plt.Axes | None = None,
-#         cmap: str = "viridis",
-#     ) -> plt.Axes:
-#         """Plot spatial image using spectral magnitude at selected frequency."""
-#         if ax is None: _, ax = plt.subplots()
-
-#         fi = self._nearest_freq_index(freq_hz)
-#         f_sel = float(self.freq_hz[fi])
-#         vals = self.spectrum_mag[:, fi]
-
-#         grid_data = self._grid_view(vals)
-#         if grid_data is not None:
-#             x_unique, z_unique, grid = grid_data
-#             im = ax.pcolormesh(x_unique, z_unique, grid, shading="auto", cmap=cmap)
-#         else:
-#             im = ax.scatter(self.data.x_mm, self.data.z_mm, c=vals, cmap=cmap, s=28, linewidths=0)
-
-#         ax.set_xlabel("x (mm)")
-#         ax.set_ylabel("z (mm)")
-#         ax.set_title(f"Spatial magnitude at {f_sel/1e6:.3f} MHz")
-#         ax.set_aspect("equal", adjustable="datalim")
-
-#         if ax.figure is not None:
-#             if len(ax.figure.axes) == 0 or ax.figure.axes[-1] is not ax:
-#                 pass
-#             plt.colorbar(im, ax=ax, label="|FFT|", fraction=0.046, pad=0.04)
-
-#         return ax
-
-#     def plot_spectrum_at_position(
-#         self,
-#         x_mm: float,
-#         z_mm: float,
-#         *,
-#         ax: plt.Axes | None = None,
-#         max_hz: float | None = None,
-#     ) -> plt.Axes:
-#         """Plot a spectrum at the nearest measured (x, z) spatial position."""
-#         if ax is None:
-#             _, ax = plt.subplots()
-
-#         row = self._nearest_row_for_position(x_mm, z_mm)
-#         x_sel = float(self.data.x_mm[row])
-#         z_sel = float(self.data.z_mm[row])
-
-#         freq = self.freq_hz
-#         mag = self.spectrum_mag[row]
-
-#         if max_hz is not None:
-#             mask = freq <= float(max_hz)
-#             freq = freq[mask]
-#             mag = mag[mask]
-
-#         ax.plot(freq, y, color="tab:blue", lw=1.2)
-#         ax.set_xlabel("Frequency (Hz)")
-#         ax.set_ylabel(ylabel)
-#         ax.set_title(
-#             f"Spectrum near x={x_sel:.2f} mm, z={z_sel:.2f} mm "
-#             f"(collection_index={self.data.collection_index[row]})"
-#         )
-
-#         return ax
-
-#     def plot_image_at_clicked_spectral_position(self, event, *, ax: plt.Axes | None = None) -> plt.Axes:
-#         """Callback-friendly method: event.xdata is treated as frequency in Hz."""
-#         if event is None or event.xdata is None:
-#             return ax if ax is not None else self._ax_image
-#         target_ax = ax if ax is not None else self._ax_image
-#         if target_ax is None:
-#             raise ValueError("No image axis available")
-#         target_ax.clear()
-#         return self.plot_image_at_frequency(float(event.xdata), ax=target_ax)
-
-#     def plot_spectrum_at_clicked_spatial_position(self, event, *, ax: plt.Axes | None = None) -> plt.Axes:
-#         """Callback-friendly method: event.(xdata, ydata) is treated as spatial (x, z)."""
-#         if event is None or event.xdata is None or event.ydata is None:
-#             return ax if ax is not None else self._ax_spectrum
-#         target_ax = ax if ax is not None else self._ax_spectrum
-#         if target_ax is None:
-#             raise ValueError("No spectrum axis available")
-#         target_ax.clear()
-#         return self.plot_spectrum_at_position(float(event.xdata), float(event.ydata), ax=target_ax)
-
-#     def build_clickable_raw_figure(
-#         self,
-#         *,
-#         initial_x: float | None = None,
-#         initial_z: float | None = None,
-#         initial_freq_hz: float | None = None,
-#         db_scale: bool = True,
-#         max_hz: float | None = None,
-#     ) -> tuple[plt.Figure, tuple[plt.Axes, plt.Axes]]:
-#         """Create linked spatial/spectral axes with click interactions enabled."""
-#         fig, axs = plt.subplots(len(self.voltage_columns)+1, 1, figsize=(10,10), constrained_layout=True)
-#         axs = axs.flatten()
-#         ax_images = axs[:-1]
-#         ax_spectrum = axs[-1]
-#         self._fig = fig
-#         self._ax_images = ax_images
-#         self._ax_spectrum = ax_spectrum
-
-#         if initial_x is None or initial_z is None:
-#             row0 = 0
-#             initial_x = float(self.data.x_mm[row0])
-#             initial_z = float(self.data.z_mm[row0])
-
-#         if initial_freq_hz is None:
-#             row0 = self._nearest_row_for_position(float(initial_x), float(initial_z))
-#             local_spec = self.spectrum_mag[row0]
-#             initial_freq_hz = float(self.freq_hz[np.argmax(local_spec)])
-
-#         self.plot_image_at_frequency(float(initial_freq_hz), axs=ax_images, cmap=self.cmap)
-        
-#         self.plot_spectrum_at_position(float(initial_x), float(initial_z), ax=ax_spectrum, 
-#                                        db_scale=db_scale, max_hz=max_hz, 
-#                                        )
-
-#         row_sel = self._nearest_row_for_position(float(initial_x), float(initial_z))
-#         self._selected_marker = ax_image.scatter(
-#             [self.data.x_mm[row_sel]],
-#             [self.data.z_mm[row_sel]],
-#             s=90,
-#             facecolors="none",
-#             edgecolors="red",
-#             linewidths=1.5,
-#         )
-
-#         freq_idx = self._nearest_freq_index(float(initial_freq_hz))
-#         freq_sel = float(self.freq_hz[freq_idx])
-#         self._freq_line = ax_spectrum.axvline(freq_sel, color="red", lw=1.0, ls="--")
-
-#         def _on_click(event) -> None:
-#             if event.inaxes is ax_image and event.xdata is not None and event.ydata is not None:
-#                 x_click = float(event.xdata)
-#                 z_click = float(event.ydata)
-#                 row = self._nearest_row_for_position(x_click, z_click)
-
-#                 ax_spectrum.clear()
-#                 self.plot_spectrum_at_position(
-#                     float(self.data.x_mm[row]),
-#                     float(self.data.z_mm[row]),
-#                     ax=ax_spectrum,
-#                     db_scale=db_scale,
-#                     max_hz=max_hz,
-#                 )
-
-#                 if self._selected_marker is not None:
-#                     self._selected_marker.remove()
-#                 self._selected_marker = ax_image.scatter(
-#                     [self.data.x_mm[row]],
-#                     [self.data.z_mm[row]],
-#                     s=90,
-#                     facecolors="none",
-#                     edgecolors="red",
-#                     linewidths=1.5,
-#                 )
-
-#                 if self._freq_line is not None:
-#                     f_now = self._freq_line.get_xdata()[0]
-#                     self._freq_line = ax_spectrum.axvline(f_now, color="red", lw=1.0, ls="--")
-
-#                 fig.canvas.draw_idle()
-
-#             elif event.inaxes is ax_spectrum and event.xdata is not None:
-#                 f_click = float(event.xdata)
-#                 ax_image.clear()
-#                 self.plot_image_at_frequency(f_click, ax=ax_image, cmap=cmap)
-
-#                 if self._selected_marker is not None:
-#                     row = self._nearest_row_for_position(
-#                         float(self._selected_marker.get_offsets()[0][0]),
-#                         float(self._selected_marker.get_offsets()[0][1]),
-#                     )
-#                     self._selected_marker = ax_image.scatter(
-#                         [self.data.x_mm[row]],
-#                         [self.data.z_mm[row]],
-#                         s=90,
-#                         facecolors="none",
-#                         edgecolors="red",
-#                         linewidths=1.5,
-#                     )
-
-#                 if self._freq_line is not None:
-#                     self._freq_line.remove()
-#                 self._freq_line = ax_spectrum.axvline(f_click, color="red", lw=1.0, ls="--")
-
-#                 fig.canvas.draw_idle()
-
-#         fig.canvas.mpl_connect("button_press_event", _on_click)
-#         return fig, (ax_image, ax_spectrum)
