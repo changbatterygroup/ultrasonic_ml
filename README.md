@@ -196,8 +196,6 @@ AcousticSQlite
 ```
 
 ### AcousticDatabase python base class and methods
-- Hook: Subclass hooks are meant to be overridden by child classes and will be marked
-
 ```
 DATABASE.sqlite3
     |
@@ -230,7 +228,7 @@ AcousticDatabase object
 |   |-- setup_raw_dataset()
 |   |-- fill_raw_dataset()
 |
-|-- Indexing - subclass hooks meant to be used with functions to fill classes
+|-- Indexing - subclass hooks which will be reviesed for specific chaped datasets
 |   |-- write_indexed_parameter() - Hook
 |   |-- idx_sqlite_data_generator() - Hook
 |   |-- <...>_generator() - Hook. multiple
