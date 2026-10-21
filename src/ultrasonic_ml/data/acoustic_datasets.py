@@ -925,7 +925,7 @@ class AcousticDatabaseFFT(AcousticDatabase):
         np.ndarray
             The group delay, in units of 1/(frequency units).
         '''
-        return -np.gradient(np.unwrap(phase_, axis=-1,), 2*np.pi*freq, axis=-1)
+        return -np.gradient(np.unwrap(phase_, axis=-1, discont=0.5*np.pi), 2*np.pi*freq, axis=-1)
     
     def _ifft(self, fft_): return np.fft.irfft(fft_)
     
@@ -964,10 +964,14 @@ class AcousticDatabaseFFT(AcousticDatabase):
             fft_grp = h5['fft_data']
             fft_dset = fft_grp['calculations']
 
-            for idx in tqdm(idxs, desc="Computing FFT", total=math.prod(self.shape[1:-1])):
-                if self.window is not None:
-                    from_waveform[*idx] = self.window(from_waveform.shape[-1])*from_waveform[*idx]
-                fft_dset[*idx] = self._fft(from_waveform[*idx])
+            if self.window is not None:
+                window = self.window(from_waveform.shape[-1])
+                for idx in tqdm(idxs, desc="Computing FFT", total=math.prod(self.shape[:-1])):
+                    fft_dset[*idx] = self._fft(window * from_waveform[*idx])
+            else:
+                for idx in tqdm(idxs, desc="Computing FFT", total=math.prod(self.shape[:-1])):
+                    fft_dset[*idx] = self._fft(from_waveform[*idx])
+                
 
     def get_fft_data(self, idx, h5):
         '''Get the values as the full spectrum, not just real portion
